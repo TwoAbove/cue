@@ -1,56 +1,60 @@
 import type { Operation } from "fast-json-patch";
-import type { Objectish, createDraft } from "immer";
+import type { createDraft, Objectish } from "immer";
 
-/**
- * PersistenceAdapter is an interface for actor state persistence.
- */
-export type PersistedEvent =
-  | {
-      readonly type: "CREATE";
-      readonly actorId: string;
-      readonly actorDefName: string;
-      readonly initialState: unknown;
-    }
-  | {
-      readonly type: "UPDATE";
-      readonly actorId: string;
-      /** The version of the state *after* this patch is applied. */
-      readonly version: bigint;
-      readonly patch: Operation[];
-    }
-  | {
-      readonly type: "SNAPSHOT";
-      readonly actorId: string;
-      readonly version: bigint;
-      readonly state: unknown;
-    };
+export type Patch = readonly Operation[];
 
-/**
- * An interface for connecting an actor system to an external persistence store.
- * Implement this interface to save and load actor states.
- */
-export interface PersistenceAdapter {
-  /**
-   * Persists an event to the store. This can be a creation, update, or snapshot event.
-   * The implementation should handle storing the event atomically.
-   * @param event The event to persist.
-   */
-  persist(event: PersistedEvent): Promise<void>;
+export interface StateSnapshot {
+  schemaVersion: number;
+  state: unknown;
+}
 
-  /**
-   * Loads an actor's state from the persistence store.
-   * It should return the most recent snapshot (baseState and baseVersion)
-   * and all subsequent patches in order. If no snapshot exists, it should
-   * return the initial state with a baseVersion of 0 and all patches since creation.
-   * @param actorId The ID of the actor to load.
-   * @returns The actor's data or null if not found.
-   */
-  load(actorId: string): Promise<{
-    baseState: unknown;
-    baseVersion: bigint;
-    patches: Operation[][];
-    actorDefName: string;
-  } | null>;
+export interface PatchStore {
+  commit(
+    actorId: string,
+    expectedVersion: bigint,
+    patch: Patch,
+    meta?: { handler: string; payload: unknown; returnVal?: unknown },
+  ): Promise<bigint>;
+
+  load(
+    actorId: string,
+    fromVersion: bigint,
+  ): Promise<{
+    snapshot: { state: StateSnapshot; version: bigint } | null;
+    patches: { version: bigint; patch: Patch }[];
+  }>;
+
+  commitSnapshot(
+    actorId: string,
+    version: bigint,
+    snapshot: StateSnapshot,
+  ): Promise<void>;
+
+  acquire?(actorId: string, owner: string, ttlMs?: number): Promise<boolean>;
+  release?(actorId: string, owner: string): Promise<void>;
+}
+
+export class RestartedError extends Error {
+  constructor(original: Error) {
+    super(`Actor restarted after error: ${original.message}`);
+    this.cause = original;
+    this.name = "RestartedError";
+  }
+}
+
+export type SupervisorStrategy = "resume" | "restart" | "stop";
+
+export interface Supervisor {
+  strategy(state: unknown, error: Error): SupervisorStrategy;
+}
+
+export interface ActorMetrics {
+  onHydrate?: (id: string) => void;
+  onSnapshot?: (id: string, version: bigint) => void;
+  onEvict?: (id: string) => void;
+  onError?: (id: string, error: Error) => void;
+  onBeforeSnapshot?: (id: string, version: bigint) => void;
+  onAfterCommit?: (id: string, version: bigint, patch: Patch) => void;
 }
 
 /**
@@ -58,7 +62,13 @@ export interface PersistenceAdapter {
  */
 export interface ActorManagerConfig<TDef extends AnyActorDefinition> {
   definition: TDef;
-  persistence?: PersistenceAdapter;
+  store?: PatchStore;
+  passivation?: {
+    idleAfter: number; // ms
+    sweepInterval?: number; // ms, default 60_000
+  };
+  supervisor?: Supervisor;
+  metrics?: ActorMetrics;
 }
 
 /**
@@ -91,62 +101,66 @@ export type ActorRef<TDef extends AnyActorDefinition> = {
  */
 export type StateOf<TDef extends AnyActorDefinition> = TDef["_state"];
 
-// biome-ignore lint/suspicious/noExplicitAny: internal escape hatch – safe at call-site
-export type CreateCommandMessage<THandler extends (...args: any[]) => unknown> =
+export type ActorVerb = "tell" | "ask" | "stream";
+
+export type CreateCommandMessage<THandler extends AnyHandler> =
   ReturnType<THandler> extends AsyncGenerator<
     infer TProgress,
     infer TReturn,
     unknown
   >
     ? {
-        type: "StreamingCommand";
+        verb: "stream";
         payload: PayloadOf<THandler>;
         progress: TProgress;
         return: Awaited<TReturn>;
       }
     : {
-        type: "Command";
+        verb: "tell";
         payload: PayloadOf<THandler>;
         return: Awaited<ReturnType<THandler>>;
       };
 
-// biome-ignore lint/suspicious/noExplicitAny: internal escape hatch – safe at call-site
-export type CreateQueryMessage<THandler extends (...args: any[]) => unknown> = {
-  type: "Query";
+export type CreateQueryMessage<THandler extends AnyHandler> = {
+  verb: "ask";
   payload: PayloadOf<THandler>;
   return: Awaited<ReturnType<THandler>>;
 };
 
-/** Extract the payload tuple from a handler: `(state, ...args) => R` becomes `...args` */
-// biome-ignore lint/suspicious/noExplicitAny: Using any makes this utility maximally flexible. The type it produces (P) is inferred from the actual function we pass to it.
-export type PayloadOf<F> = F extends (state: any, ...args: infer P) => unknown
-  ? P
-  : never;
+// biome-ignore lint/suspicious/noExplicitAny: This is intentional for the builder
+export type AnyHandler = (...args: any[]) => unknown;
 
-// biome-ignore lint/suspicious/noExplicitAny: internal escape hatch – safe at call-site
-export type AnyHandler = (state: any, ...args: any[]) => unknown;
+export type PayloadOf<F> =
+  /* state-ful command / stream */
+  // biome-ignore lint/suspicious/noExplicitAny: This is intentional for the builder
+  F extends (state: Draft<any>, ...args: infer P) => unknown
+    ? P
+    : /* read-only query */
+      // biome-ignore lint/suspicious/noExplicitAny: This is intentional for the builder
+      F extends (state: Readonly<any>, ...args: infer P) => unknown
+      ? P
+      : /* helper with no state arg (tests, utilities, etc.) */
+        F extends (...args: infer P) => unknown
+        ? P
+        : never;
 
 export type CreateMessageMap<
-  // biome-ignore lint/suspicious/noExplicitAny: internal escape hatch – safe at call-site
-  TCommands extends Record<string, (...args: any[]) => unknown>,
-  // biome-ignore lint/suspicious/noExplicitAny: internal escape hatch – safe at call-site
-  TQueries extends Record<string, (...args: any[]) => unknown>,
+  TCommands extends Record<string, AnyHandler>,
+  TQueries extends Record<string, AnyHandler>,
 > = {
   [K in keyof TCommands]: CreateCommandMessage<TCommands[K]>;
 } & {
   [K in keyof TQueries]: CreateQueryMessage<TQueries[K]>;
 };
 
-export type MessageMap = Record<string, MessageDefinition>;
-type MessageDefinition =
-  | { type: "Command"; payload: unknown[]; return: unknown }
-  | {
-      type: "StreamingCommand";
-      payload: unknown[];
-      progress: unknown;
-      return: unknown;
-    }
-  | { type: "Query"; payload: unknown[]; return: unknown };
+export type MessageMap = Record<string, MessageDefinition<ActorVerb>>;
+
+type MessageDefinition<V extends ActorVerb> = {
+  verb: V;
+  payload: unknown[];
+  progress?: unknown; // only for "stream"
+  return: unknown;
+};
 
 export type ActorDefinition<
   TName extends string,
@@ -159,14 +173,32 @@ export type ActorDefinition<
   readonly _tag: "ActorDefinition";
 };
 
+export type VersionEntry<TPrevState, TNewState> =
+  | {
+      schemaVersion: 1;
+      initialState: () => TNewState;
+      upcaster?: never;
+    }
+  | {
+      schemaVersion: number;
+      initialState: () => TNewState;
+      upcaster: (prevState: TPrevState) => TNewState;
+    };
+
 /** @internal Invisible fields used by the framework but not exposed to the user. */
-export type InternalDefinitionFields<TState> = {
-  readonly _initialState: () => TState;
+export type InternalDefinitionFields<_TState = unknown> = {
+  readonly _initialStateFn: () => object;
+  // biome-ignore lint/suspicious/noExplicitAny: Upcasters must handle any previous state shape
+  readonly _upcasters: ReadonlyArray<(prevState: any) => any>;
   readonly _handlers: Record<
     string,
-    { type: "command" | "query" | "stream"; fn: AnyHandler }
+    | { type: "command"; fn: AnyHandler }
+    | { type: "stream"; fn: AnyHandler }
+    | { type: "query"; fn: AnyHandler }
   >;
-  readonly _persistence?: { snapshotEvery?: number };
+  readonly _persistence?: {
+    snapshotEvery?: number;
+  };
 };
 
 // biome-ignore lint/suspicious/noExplicitAny: This is intentional
@@ -174,39 +206,40 @@ export type AnyActorDefinition = ActorDefinition<string, any, any> &
   // biome-ignore lint/suspicious/noExplicitAny: This is intentional
   InternalDefinitionFields<any>;
 
-type MessagesOf<TDef extends AnyActorDefinition> = TDef["_messages"];
+export type MessagesOf<TDef extends AnyActorDefinition> = TDef["_messages"];
 
-export type FilterMessages<TMap, TType> = {
-  [K in keyof TMap as TMap[K] extends { type: TType } ? K : never]: TMap[K];
+export type FilterMessages<TMap, TVerb> = {
+  [K in keyof TMap as TMap[K] extends { verb: TVerb } ? K : never]: TMap[K];
 };
 
-type TellProxy<TDef extends AnyActorDefinition> = {
-  [K in keyof FilterMessages<
-    MessagesOf<TDef>,
-    "Command" | "StreamingCommand"
-  >]: (
+export type TellProxyOf<TDef extends AnyActorDefinition> = {
+  [K in keyof FilterMessages<MessagesOf<TDef>, "tell" | "stream">]: (
     ...args: MessagesOf<TDef>[K]["payload"]
   ) => Promise<MessagesOf<TDef>[K]["return"]>;
 };
 
-type AskProxy<TDef extends AnyActorDefinition> = {
-  [K in keyof FilterMessages<MessagesOf<TDef>, "Query">]: (
+export type AskProxyOf<TDef extends AnyActorDefinition> = {
+  [K in keyof FilterMessages<MessagesOf<TDef>, "ask">]: (
     ...args: MessagesOf<TDef>[K]["payload"]
-  ) => Promise<Extract<MessagesOf<TDef>[K], { type: "Query" }>["return"]>;
+  ) => Promise<Extract<MessagesOf<TDef>[K], { verb: "ask" }>["return"]>;
 };
 
-type StreamProxy<TDef extends AnyActorDefinition> = {
-  [K in keyof FilterMessages<MessagesOf<TDef>, "StreamingCommand">]: (
+export type StreamProxyOf<TDef extends AnyActorDefinition> = {
+  [K in keyof FilterMessages<MessagesOf<TDef>, "stream">]: (
     ...args: MessagesOf<TDef>[K]["payload"]
   ) => AsyncIterable<
-    Extract<MessagesOf<TDef>[K], { type: "StreamingCommand" }>["progress"]
+    Extract<MessagesOf<TDef>[K], { verb: "stream" }>["progress"]
   >;
 };
 
-/** Extract the progress and return types for async generators */
-export type StreamInfo<F> = F extends AsyncGenerator<infer Prog, infer Ret, F>
-  ? { progress: Prog; return: Awaited<Ret> }
-  : never;
+type TellProxy<TDef extends AnyActorDefinition> = TellProxyOf<TDef>;
+type AskProxy<TDef extends AnyActorDefinition> = AskProxyOf<TDef>;
+type StreamProxy<TDef extends AnyActorDefinition> = StreamProxyOf<TDef>;
+
+/**
+ * A safer alternative to Objectish that works with exactOptionalPropertyTypes
+ */
+export type Draftable<T> = T extends object ? Draft<T> : never;
 
 /**
  * A utility type that marks a type as being mutable within a command handler,
@@ -215,3 +248,11 @@ export type StreamInfo<F> = F extends AsyncGenerator<infer Prog, infer Ret, F>
 export type Draft<T> = T extends Objectish
   ? ReturnType<typeof createDraft<T>>
   : never;
+
+/**
+ * Branded type to ensure handler-state cohesion at compile time.
+ * This prevents commands from mutating properties that don't exist in the initial state.
+ */
+export type DraftStateOf<TDef extends AnyActorDefinition> = Draft<
+  TDef["_state"]
+> & { __brand?: never };

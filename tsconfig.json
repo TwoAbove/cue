@@ -6,18 +6,20 @@
     "verbatimModuleSyntax": true,
     "noEmit": true,
     "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "noImplicitOverride": true,
+    "useUnknownInCatchVariables": true,
     "skipLibCheck": true,
     "baseUrl": "./",
     "paths": {
-      "*": ["./src/*"]
+      "@/*": ["./src/*"]
     },
     "outDir": "./dist",
-    "types": ["vitest/globals"],
+    "types": ["node"],
     "composite": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "test", "tests", "coverage"],
-  "tsc-alias": {
-    "resolveFullPaths": true
-  }
+  "exclude": ["node_modules", "dist", "test", "tests", "coverage"]
 }

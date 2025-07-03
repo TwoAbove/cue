@@ -4,7 +4,7 @@ import type { ActorManager } from "./contracts";
 
 describe("Actor Manager API", () => {
   const counterActorDef = defineActor("Counter")
-    .withInitialState((): { count: number; lastUpdated?: Date } => ({
+    .initialState((): { count: number; lastUpdated?: Date } => ({
       count: 0,
     }))
     .commands({
@@ -79,7 +79,7 @@ describe("Actor Manager API", () => {
       }
     }
     const bankActorDef = defineActor("BankAccount")
-      .withInitialState((): { balance: number } => ({ balance: 100 }))
+      .initialState((): { balance: number } => ({ balance: 100 }))
       .commands({
         Withdraw: (state, payload: { amount: number }) => {
           if (payload.amount > state.balance) {
@@ -101,10 +101,10 @@ describe("Actor Manager API", () => {
     it("should reject the promise when a command handler throws an error", async () => {
       const bankActor = bankManager.get("bank-error");
       await expect(bankActor.tell.Withdraw({ amount: 500 })).rejects.toThrow(
-        "Insufficient funds"
+        "Insufficient funds",
       );
       await expect(
-        bankActor.tell.Withdraw({ amount: 500 })
+        bankActor.tell.Withdraw({ amount: 500 }),
       ).rejects.toBeInstanceOf(InsufficientFundsError);
     });
 
@@ -121,7 +121,7 @@ describe("Actor Manager API", () => {
 
     it("should reject the promise when a query handler throws an error", async () => {
       const errorActorDef = defineActor("ErrorQuery")
-        .withInitialState((): object => ({}))
+        .initialState((): object => ({}))
         .queries({
           BadQuery: (_state) => {
             throw new Error("This query failed");
@@ -137,7 +137,7 @@ describe("Actor Manager API", () => {
 
   describe("Streaming Commands", () => {
     const storyActorDef = defineActor("StoryGenerator")
-      .withInitialState((): { final?: string; progressUpdates: number } => ({
+      .initialState((): { final?: string; progressUpdates: number } => ({
         progressUpdates: 0,
       }))
       .commands({
@@ -148,6 +148,7 @@ describe("Actor Manager API", () => {
           yield { type: "Token", value: "upon" };
           state.progressUpdates++;
           yield { type: "Token", value: "a time." };
+          state.final = "Once upon a time.";
           return { final: "Once upon a time." };
         },
       })
@@ -221,7 +222,7 @@ describe("Actor Manager API", () => {
 
   describe("Commands with Return Values", () => {
     const returnerActorDef = defineActor("Returner")
-      .withInitialState((): { value: number } => ({ value: 0 }))
+      .initialState((): { value: number } => ({ value: 0 }))
       .commands({
         SyncAdd: (state, payload: { num: number }) => {
           state.value += payload.num;
@@ -271,6 +272,21 @@ describe("Actor Manager API", () => {
       expect(result).toBe("final-value");
       const { state } = await actor.inspect();
       expect(state.value).toBe(20);
+    });
+
+    it("should process concurrent commands sequentially and return correct values", async () => {
+      const actor = returnerManager.get("ret-concurrent");
+      const promises = [
+        actor.tell.SyncAdd({ num: 1 }), // returns 1
+        actor.tell.SyncAdd({ num: 2 }), // returns 3
+        actor.tell.SyncAdd({ num: 3 }), // returns 6
+      ];
+
+      const results = await Promise.all(promises);
+      expect(results).toEqual([1, 3, 6]);
+
+      const { state } = await actor.inspect();
+      expect(state.value).toBe(6);
     });
   });
 });

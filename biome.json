@@ -7,11 +7,7 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "includes": [
-      "**",
-      "!**/dist",
-      "!**/.vscode"
-    ]
+    "includes": ["**", "!**/dist", "!**/.vscode", "!**/coverage"]
   },
   "formatter": {
     "enabled": true,
@@ -32,20 +28,14 @@
         "useExhaustiveDependencies": "info"
       },
       "suspicious": {
-        "noExplicitAny": {
-          "level": "info"
-        }
+        "noExplicitAny": "error"
       },
       "nursery": {
         "useSortedClasses": {
           "level": "warn",
           "fix": "safe",
           "options": {
-            "functions": [
-              "clsx",
-              "cva",
-              "cn"
-            ]
+            "functions": ["clsx", "cva", "cn"]
           }
         }
       },

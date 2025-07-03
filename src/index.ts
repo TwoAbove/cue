@@ -1,6 +1,5 @@
-import { type Operation, applyPatch, compare } from "fast-json-patch";
-import { type Objectish, createDraft, finishDraft } from "immer";
-import superjson from "superjson";
+import type { Objectish } from "immer";
+import { Actor } from "./actor/Actor.js";
 import type {
   ActorDefinition,
   ActorManager,
@@ -8,15 +7,39 @@ import type {
   ActorRef,
   AnyActorDefinition,
   AnyHandler,
+  AskProxyOf,
   CreateMessageMap,
   Draft,
   InternalDefinitionFields,
   StateOf,
+  StreamProxyOf,
+  TellProxyOf,
+} from "./contracts.ts";
+
+export type { Objectish } from "immer";
+export { Actor } from "./actor/Actor.js";
+export type {
+  ActorDefinition,
+  ActorManager,
+  ActorManagerConfig,
+  ActorMetrics,
+  ActorRef,
+  AskProxyOf,
+  Draftable,
+  DraftStateOf,
+  StateOf,
+  StreamProxyOf,
+  Supervisor,
+  SupervisorStrategy,
+  TellProxyOf,
 } from "./contracts.ts";
 
 // --- Internal Types ---
 
-type HandlerFn = (...args: unknown[]) => unknown;
+const IsAsyncGen = (fn: AnyHandler): boolean =>
+  Object.prototype.toString.call(fn) === "[object AsyncGeneratorFunction]";
+
+type HandlerFn = AnyHandler;
 
 type HandlerEntry =
   | { type: "command"; fn: HandlerFn }
@@ -31,45 +54,58 @@ type FullActorDefinition<
 > = ActorDefinition<TName, TState, CreateMessageMap<TCommands, TQueries>> &
   InternalDefinitionFields<TState>;
 
-type ActorContainer<TState> = {
-  // biome-ignore lint/suspicious/noExplicitAny: We are using any as a placeholder for the parts of the FullActorDefinition that are not relevant to the ActorContainer itself.
-  def: FullActorDefinition<any, TState, any, any>;
-} & (
-  | { status: "pending" }
-  | { status: "hydrating"; hydrationPromise: Promise<void> }
-  | { status: "active"; state: TState; version: bigint }
-  | { status: "failed"; error: Error }
-  | { status: "shutdown" }
-);
-
 // --- Actor Definition Builder ---
 
 class ActorDefinitionBuilder<
   TName extends string,
   TState extends Objectish,
-  TCommands extends Record<string, AnyHandler>,
-  TQueries extends Record<string, AnyHandler>,
+  TCommands extends object = Record<string, never>,
+  TQueries extends object = Record<string, never>,
 > {
-  private _persistenceConfig?: { snapshotEvery?: number };
+  private _persistenceConfig?: {
+    snapshotEvery?: number;
+  };
 
   constructor(
     private readonly name: TName,
-    private readonly initialState: () => TState,
+    private readonly initialStateFn: () => object,
+    // biome-ignore lint/suspicious/noExplicitAny: Upcasters must handle any previous state shape
+    private readonly upcasters: ReadonlyArray<(prevState: any) => any>,
     private readonly commandsConfig: TCommands,
     private readonly queriesConfig: TQueries,
   ) {}
 
+  public evolveTo<TNewState extends Objectish>(
+    upcaster: (prevState: TState) => TNewState,
+  ): ActorDefinitionBuilder<
+    TName,
+    TNewState,
+    Record<string, never>,
+    Record<string, never>
+  > {
+    return new ActorDefinitionBuilder(
+      this.name,
+      this.initialStateFn,
+      [...this.upcasters, upcaster],
+      {},
+      {},
+    );
+  }
+
   public commands<
     const C extends Record<
       string,
-      // biome-ignore lint/suspicious/noExplicitAny: When a user defines a command, we have no idea what arguments that command will take.
+      // biome-ignore lint/suspicious/noExplicitAny: This is intentional for the builder
       (state: Draft<TState>, ...args: any[]) => unknown
     >,
-  >(commands: C): ActorDefinitionBuilder<TName, TState, C, TQueries> {
+  >(
+    newCommands: C,
+  ): ActorDefinitionBuilder<TName, TState, TCommands & C, TQueries> {
     return new ActorDefinitionBuilder(
       this.name,
-      this.initialState,
-      commands,
+      this.initialStateFn,
+      this.upcasters,
+      { ...this.commandsConfig, ...newCommands },
       this.queriesConfig,
     );
   }
@@ -77,15 +113,18 @@ class ActorDefinitionBuilder<
   public queries<
     const Q extends Record<
       string,
-      // biome-ignore lint/suspicious/noExplicitAny: When a user defines a command, we have no idea what arguments that command will take.
+      // biome-ignore lint/suspicious/noExplicitAny: This is intentional for the builder
       (state: Readonly<TState>, ...args: any[]) => unknown
     >,
-  >(queries: Q): ActorDefinitionBuilder<TName, TState, TCommands, Q> {
+  >(
+    newQueries: Q,
+  ): ActorDefinitionBuilder<TName, TState, TCommands, TQueries & Q> {
     return new ActorDefinitionBuilder(
       this.name,
-      this.initialState,
+      this.initialStateFn,
+      this.upcasters,
       this.commandsConfig,
-      queries,
+      { ...this.queriesConfig, ...newQueries },
     );
   }
 
@@ -94,348 +133,289 @@ class ActorDefinitionBuilder<
     return this;
   }
 
-  public build(): FullActorDefinition<TName, TState, TCommands, TQueries> {
+  public build(): FullActorDefinition<
+    TName,
+    TState,
+    TCommands & Record<string, AnyHandler>,
+    TQueries & Record<string, AnyHandler>
+  > {
     const handlers: Record<string, HandlerEntry> = {};
     for (const key in this.commandsConfig) {
-      const fn = this.commandsConfig[key];
-      handlers[key] = {
-        type:
-          fn.constructor.name === "AsyncGeneratorFunction"
-            ? "stream"
-            : "command",
-        fn,
-      };
+      const fn = (this.commandsConfig as Record<string, HandlerFn>)[key];
+
+      if (!fn) {
+        continue;
+      }
+
+      if (fn) {
+        handlers[key] = {
+          type: IsAsyncGen(fn) ? "stream" : "command",
+          fn,
+        };
+      }
     }
     for (const key in this.queriesConfig) {
-      handlers[key] = { type: "query", fn: this.queriesConfig[key] };
+      const fn = (this.queriesConfig as Record<string, HandlerFn>)[key];
+      if (fn) {
+        handlers[key] = { type: "query", fn };
+      }
     }
 
     return {
       _tag: "ActorDefinition",
       _name: this.name,
       _state: null as unknown as TState, // Type carrier
-      _messages: null as never, // Type carrier
-      _initialState: this.initialState,
+      _messages: null as unknown as CreateMessageMap<
+        TCommands & Record<string, AnyHandler>,
+        TQueries & Record<string, AnyHandler>
+      >, // Type carrier
+      _initialStateFn: this.initialStateFn,
+      _upcasters: this.upcasters,
       _handlers: handlers,
-      _persistence: this._persistenceConfig,
+      ...(this._persistenceConfig && { _persistence: this._persistenceConfig }),
     };
   }
 }
 
 export function defineActor<TName extends string>(name: TName) {
   return {
-    withInitialState<TState extends Objectish>(initialState: () => TState) {
-      return new ActorDefinitionBuilder<
-        TName,
-        TState,
-        Record<string, never>,
-        Record<string, never>
-      >(name, initialState, {}, {});
+    initialState<TState extends Objectish>(initialStateFn: () => TState) {
+      return new ActorDefinitionBuilder<TName, TState>(
+        name,
+        initialStateFn,
+        [],
+        {},
+        {},
+      );
     },
   };
 }
 
+// --- Typed Proxy Builders ---
+
+/**
+ * Builds a tell proxy for fire-and-forget actor commands and streams.
+ *
+ * **Important streaming behavior**: When calling `tell.SomeStream()`, the stream
+ * is eagerly drained to completion before returning the final value. This means:
+ * - All yielded values are consumed but not returned to the caller
+ * - Only the final return value from the stream is returned
+ * - The stream runs to completion synchronously within the actor's mailbox
+ *
+ * If you need to consume individual yielded values, use the `stream` verb instead
+ * of `tell` to get access to the AsyncGenerator.
+ *
+ * @param actor - The actor instance to proxy commands to
+ * @param definition - The actor definition containing handler metadata
+ * @param isShutdown - Function to check if the actor manager is shut down
+ * @returns A proxy object with methods for each command and stream handler
+ */
+function buildTellProxy<TDef extends AnyActorDefinition>(
+  actor: Actor<StateOf<TDef>>,
+  definition: TDef,
+  isShutdown: () => boolean,
+): TellProxyOf<TDef> {
+  const proxy: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+
+  for (const name in definition._handlers) {
+    const entry = definition._handlers[name];
+    if (!entry) continue;
+
+    if (entry.type === "command") {
+      proxy[name] = async (...args: unknown[]) => {
+        if (isShutdown()) {
+          throw new Error(
+            "ActorManager is shut down. Cannot interact with actors.",
+          );
+        }
+        return actor.handleTell(name, args);
+      };
+    } else if (entry.type === "stream") {
+      proxy[name] = async (...args: unknown[]) => {
+        if (isShutdown()) {
+          throw new Error(
+            "ActorManager is shut down. Cannot interact with actors.",
+          );
+        }
+        const iterator = actor.handleStream(name, args);
+        let next = await iterator.next();
+        while (!next.done) {
+          next = await iterator.next();
+        }
+        return next.value;
+      };
+    }
+  }
+
+  return proxy as TellProxyOf<TDef>;
+}
+
+function buildAskProxy<TDef extends AnyActorDefinition>(
+  actor: Actor<StateOf<TDef>>,
+  definition: TDef,
+  isShutdown: () => boolean,
+): AskProxyOf<TDef> {
+  const proxy: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+
+  for (const name in definition._handlers) {
+    const entry = definition._handlers[name];
+    if (!entry || entry.type !== "query") continue;
+
+    proxy[name] = async (...args: unknown[]) => {
+      if (isShutdown()) {
+        throw new Error(
+          "ActorManager is shut down. Cannot interact with actors.",
+        );
+      }
+      return actor.handleAsk(name, args);
+    };
+  }
+
+  return proxy as AskProxyOf<TDef>;
+}
+
+function buildStreamProxy<TDef extends AnyActorDefinition>(
+  actor: Actor<StateOf<TDef>>,
+  definition: TDef,
+  isShutdown: () => boolean,
+): StreamProxyOf<TDef> {
+  const proxy: Record<string, (...args: unknown[]) => AsyncIterable<unknown>> =
+    {};
+
+  for (const name in definition._handlers) {
+    const entry = definition._handlers[name];
+    if (!entry || entry.type !== "stream") continue;
+
+    proxy[name] = async function* (...args: unknown[]) {
+      if (isShutdown()) {
+        throw new Error(
+          "ActorManager is shut down. Cannot interact with actors.",
+        );
+      }
+      yield* actor.handleStream(name, args);
+    };
+  }
+
+  return proxy as StreamProxyOf<TDef>;
+}
+
 // --- Actor Manager Implementation ---
 
-const createComparableState = (state: unknown) => {
-  return JSON.parse(superjson.stringify(state));
-};
+// Overload for inline actor definitions with better type inference
+export function createActorManager<
+  const TName extends string,
+  TState,
+  TCmds extends Record<string, HandlerFn>,
+  TQs extends Record<string, HandlerFn>,
+>(
+  config: ActorManagerConfig<
+    ActorDefinition<TName, TState, CreateMessageMap<TCmds, TQs>> &
+      InternalDefinitionFields<TState>
+  >,
+): ActorManager<
+  ActorDefinition<TName, TState, CreateMessageMap<TCmds, TQs>> &
+    InternalDefinitionFields<TState>
+>;
+
+// Main implementation
+export function createActorManager<TDef extends AnyActorDefinition>(
+  config: ActorManagerConfig<TDef>,
+): ActorManager<TDef>;
 
 export function createActorManager<TDef extends AnyActorDefinition>(
   config: ActorManagerConfig<TDef>,
 ): ActorManager<TDef> {
-  const { persistence, definition } = config;
+  const { store, definition, passivation, supervisor, metrics } = config;
+  const instanceUUID = crypto.randomUUID();
+
   type TState = StateOf<TDef>;
 
   // This map is now strongly typed with this manager's specific state type.
-  const actors = new Map<string, ActorContainer<TState>>();
-  const clone = <T>(obj: T): T => superjson.parse(superjson.stringify(obj));
+  const actors = new Map<string, Actor<TState>>();
   let isShutdown = false;
+  let sweeper: NodeJS.Timeout | undefined;
 
-  const getActiveActor = async (
-    id: string,
-  ): Promise<Extract<ActorContainer<TState>, { status: "active" }>> => {
-    if (isShutdown) {
-      throw new Error(
-        "ActorManager is shut down. Cannot interact with actors.",
-      );
-    }
-    const container = actors.get(id);
-    if (!container) {
-      throw new Error(`Internal error: actor with id "${id}" not found.`);
-    }
+  // Set up passivation if configured
+  if (passivation) {
+    const evictIdle = async () => {
+      if (isShutdown) return;
 
-    switch (container.status) {
-      case "active":
-        return container;
-      case "hydrating":
-        await container.hydrationPromise;
-        // The container might have changed status, so we recurse.
-        return getActiveActor(id);
-      case "failed":
-        throw container.error;
-      case "shutdown":
-        throw new Error(
-          `Actor with id "${id}" has been shut down. A new reference must be created via get().`,
-        );
-      case "pending": {
-        if (!persistence) {
-          const newContainer: ActorContainer<TState> = {
-            ...container,
-            status: "active",
-            state: container.def._initialState(),
-            version: 0n,
-          };
-          actors.set(id, newContainer);
-          return newContainer;
+      for (const [id, actor] of actors) {
+        if (Date.now() - actor.lastActivity > passivation.idleAfter) {
+          await actor.maybeSnapshot();
+          await actor.shutdown();
+          actors.delete(id);
+          metrics?.onEvict?.(id);
         }
-
-        const hydrationPromise = (async () => {
-          try {
-            const loaded = await persistence.load(id);
-            if (loaded) {
-              if (loaded.actorDefName !== container.def._name) {
-                throw new Error(
-                  `Definition mismatch for actor "${id}". Stored: "${loaded.actorDefName}", Provided: "${container.def._name}".`,
-                );
-              }
-              let stateAsJson = createComparableState(loaded.baseState);
-              for (const patch of loaded.patches) {
-                stateAsJson = applyPatch(stateAsJson, patch).newDocument;
-              }
-              actors.set(id, {
-                ...container,
-                status: "active",
-                state: superjson.parse(JSON.stringify(stateAsJson)),
-                version: loaded.baseVersion + BigInt(loaded.patches.length),
-              });
-            } else {
-              const initialState = container.def._initialState();
-              await persistence.persist({
-                type: "CREATE",
-                actorId: id,
-                actorDefName: container.def._name,
-                initialState: clone(initialState),
-              });
-              actors.set(id, {
-                ...container,
-                status: "active",
-                state: initialState,
-                version: 0n,
-              });
-            }
-          } catch (error) {
-            actors.set(id, {
-              ...container,
-              status: "failed",
-              error: error as Error,
-            });
-            // Re-throw so the initial caller knows about the failure.
-            throw error;
-          }
-        })();
-        actors.set(id, { ...container, status: "hydrating", hydrationPromise });
-        await hydrationPromise;
-        return getActiveActor(id);
       }
+    };
+
+    sweeper = setInterval(evictIdle, passivation.sweepInterval ?? 60_000);
+    sweeper.unref();
+  }
+
+  const getActor = (id: string): Actor<TState> => {
+    if (isShutdown) {
+      throw new Error("ActorManager is shut down. Cannot create new actors.");
     }
+
+    let actor = actors.get(id);
+    if (!actor || actor.isFailed) {
+      if (actor?.isFailed) {
+        actors.delete(id);
+      }
+      actor = new Actor(
+        id,
+        definition,
+        store,
+        instanceUUID,
+        supervisor,
+        metrics,
+      );
+      actors.set(id, actor);
+    }
+    return actor;
   };
 
   return {
     get(id: string): ActorRef<TDef> {
-      if (isShutdown) {
-        throw new Error("ActorManager is shut down. Cannot create new actors.");
-      }
+      const actor = getActor(id);
 
-      let container = actors.get(id);
-      if (
-        !container ||
-        container.status === "failed" ||
-        container.status === "shutdown"
-      ) {
-        container = { def: definition, status: "pending" };
-        actors.set(id, container);
-      }
-
-      // biome-ignore lint/suspicious/noExplicitAny: This is fine because we then cast these to ActorRef<TDef>
-      const tellProxy: any = {};
-      // biome-ignore lint/suspicious/noExplicitAny: same
-      const askProxy: any = {};
-      // biome-ignore lint/suspicious/noExplicitAny: same
-      const streamProxy: any = {};
-
-      for (const name in definition._handlers) {
-        const entry = definition._handlers[name];
-        switch (entry.type) {
-          case "query":
-            askProxy[name] = async (...args: unknown[]) => {
-              const activeContainer = await getActiveActor(id);
-              // State is now correctly typed as TState
-              return entry.fn(activeContainer.state, ...args);
-            };
-            break;
-
-          case "command":
-            tellProxy[name] = async (...args: unknown[]) => {
-              const activeContainer = await getActiveActor(id);
-              const { state: currentState, version: currentVersion } =
-                activeContainer;
-
-              const draftState = createDraft(currentState);
-              const returnValue = await Promise.resolve(
-                entry.fn(draftState, ...args),
-              );
-              const nextState = finishDraft(draftState);
-
-              if (nextState !== currentState) {
-                const patch = compare(
-                  createComparableState(currentState),
-                  createComparableState(nextState),
-                );
-                if (patch.length > 0) {
-                  const newVersion = currentVersion + 1n;
-                  if (persistence) {
-                    await persistence.persist({
-                      type: "UPDATE",
-                      actorId: id,
-                      version: newVersion,
-                      patch,
-                    });
-                  }
-                  actors.set(id, {
-                    ...activeContainer,
-                    state: nextState,
-                    version: newVersion,
-                  });
-
-                  if (
-                    definition._persistence?.snapshotEvery &&
-                    newVersion %
-                      BigInt(definition._persistence.snapshotEvery) ===
-                      0n
-                  ) {
-                    persistence
-                      ?.persist({
-                        type: "SNAPSHOT",
-                        actorId: id,
-                        version: newVersion,
-                        state: clone(nextState),
-                      })
-                      .catch(() => {
-                        /* Non-critical, fire-and-forget */
-                      });
-                  }
-                }
-              }
-              return returnValue;
-            };
-            break;
-
-          case "stream": {
-            const streamHandler = async function* (...payload: unknown[]) {
-              const activeContainer = await getActiveActor(id);
-              const { state: currentState, version: currentVersion } =
-                activeContainer;
-
-              const draftState = createDraft(currentState);
-              const generator = entry.fn(
-                draftState,
-                ...payload,
-              ) as AsyncGenerator;
-              const finalUpdate = yield* generator;
-
-              if (typeof finalUpdate === "object" && finalUpdate !== null) {
-                Object.assign(draftState, finalUpdate);
-              }
-              const nextState = finishDraft(draftState);
-
-              const patch = compare(
-                createComparableState(currentState),
-                createComparableState(nextState),
-              );
-              if (patch.length > 0) {
-                const newVersion = currentVersion + 1n;
-                if (persistence) {
-                  await persistence.persist({
-                    type: "UPDATE",
-                    actorId: id,
-                    version: newVersion,
-                    patch,
-                  });
-                }
-                actors.set(id, {
-                  ...activeContainer,
-                  state: nextState,
-                  version: newVersion,
-                });
-
-                if (
-                  definition._persistence?.snapshotEvery &&
-                  newVersion % BigInt(definition._persistence.snapshotEvery) ===
-                    0n
-                ) {
-                  persistence
-                    ?.persist({
-                      type: "SNAPSHOT",
-                      actorId: id,
-                      version: newVersion,
-                      state: clone(nextState),
-                    })
-                    .catch(() => {
-                      /* Non-critical, fire-and-forget */
-                    });
-                }
-              }
-              return finalUpdate;
-            };
-
-            streamProxy[name] = (...args: unknown[]) => streamHandler(...args);
-            tellProxy[name] = async (...args: unknown[]) => {
-              const iterator = streamHandler(...args);
-              let next = await iterator.next();
-              while (!next.done) {
-                next = await iterator.next();
-              }
-              return next.value;
-            };
-            break;
-          }
-        }
-      }
+      const tellProxy = buildTellProxy(actor, definition, () => isShutdown);
+      const askProxy = buildAskProxy(actor, definition, () => isShutdown);
+      const streamProxy = buildStreamProxy(actor, definition, () => isShutdown);
 
       return {
         ask: askProxy,
         tell: tellProxy,
         stream: streamProxy,
         inspect: async () => {
-          const activeContainer = await getActiveActor(id);
-          return {
-            state: clone(activeContainer.state),
-            version: activeContainer.version,
-          };
+          if (isShutdown) {
+            throw new Error(
+              "ActorManager is shut down. Cannot interact with actors.",
+            );
+          }
+          return actor.inspect();
         },
         shutdown: async () => {
-          const container = actors.get(id);
-          if (!container) return;
-
-          if (container.status === "hydrating") {
-            try {
-              await container.hydrationPromise;
-            } catch {
-              // Ignore hydration error on shutdown, the actor will be marked as 'shutdown' anyway.
-            }
-          }
-          actors.set(id, { def: container.def, status: "shutdown" });
+          await actor.shutdown();
+          actors.delete(id);
         },
-      } as ActorRef<TDef>;
+      };
     },
     shutdown: async () => {
       if (isShutdown) return;
       isShutdown = true;
-      const hydrationPromises = [...actors.values()]
-        .map((c) => (c.status === "hydrating" ? c.hydrationPromise : null))
-        .filter(Boolean);
-      await Promise.allSettled(hydrationPromises);
+
+      if (sweeper) {
+        clearInterval(sweeper);
+        sweeper = undefined;
+      }
+
+      const shutdownPromises = [...actors.values()].map((actor) => {
+        return actor.shutdown();
+      });
+      await Promise.allSettled(shutdownPromises);
       actors.clear();
     },
   };

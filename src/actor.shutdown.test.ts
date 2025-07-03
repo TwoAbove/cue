@@ -1,15 +1,10 @@
-import type { Operation } from "fast-json-patch";
-import superjson from "superjson";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createActorManager, defineActor } from "./";
-import type {
-  ActorManager,
-  PersistedEvent,
-  PersistenceAdapter,
-} from "./contracts";
+import type { ActorManager } from "./contracts";
+import { createInMemoryPatchStore } from "./store/inMemory.mock.js";
 
 const counterActorDef = defineActor("Counter")
-  .withInitialState(() => ({ count: 0 }))
+  .initialState(() => ({ count: 0 }))
   .commands({
     Inc: (state) => {
       state.count++;
@@ -19,79 +14,6 @@ const counterActorDef = defineActor("Counter")
     Get: (state) => state.count,
   })
   .build();
-
-const createInMemoryPersistenceAdapter = () => {
-  const store = new Map<
-    string,
-    {
-      initialState: unknown;
-      patches: { version: bigint; patch: Operation[] }[];
-      actorDefName: string;
-      snapshots: { version: bigint; state: unknown }[];
-    }
-  >();
-
-  const adapter = {
-    persist: vi.fn(async (event: PersistedEvent) => {
-      if (event.type === "CREATE") {
-        store.set(event.actorId, {
-          initialState: superjson.parse(
-            superjson.stringify(event.initialState),
-          ),
-          patches: [],
-          snapshots: [],
-          actorDefName: event.actorDefName,
-        });
-      } else {
-        const record = store.get(event.actorId);
-        if (!record) throw new Error("Actor not found");
-        if (event.type === "UPDATE") {
-          record.patches.push({ version: event.version, patch: event.patch });
-        } else if (event.type === "SNAPSHOT") {
-          record.snapshots.push({
-            version: event.version,
-            state: superjson.parse(superjson.stringify(event.state)),
-          });
-        }
-      }
-    }),
-    load: vi.fn(async (actorId: string) => {
-      const record = store.get(actorId);
-      if (!record) return null;
-      const latestSnapshot =
-        record.snapshots.length > 0
-          ? record.snapshots.reduce((a, b) => (a.version > b.version ? a : b))
-          : null;
-      if (latestSnapshot) {
-        const patches = record.patches
-          .filter((p) => p.version > latestSnapshot.version)
-          .sort((a, b) => (a.version > b.version ? 1 : -1))
-          .map((p) => p.patch);
-        return {
-          baseState: superjson.parse(superjson.stringify(latestSnapshot.state)),
-          baseVersion: latestSnapshot.version,
-          patches,
-          actorDefName: record.actorDefName,
-        };
-      }
-      const patches = record.patches
-        .sort((a, b) => (a.version > b.version ? 1 : -1))
-        .map((p) => p.patch);
-      return {
-        baseState: superjson.parse(superjson.stringify(record.initialState)),
-        baseVersion: 0n,
-        patches,
-        actorDefName: record.actorDefName,
-      };
-    }),
-    clear: () => {
-      store.clear();
-      (adapter.persist as unknown as { mockClear: () => void }).mockClear();
-      (adapter.load as unknown as { mockClear: () => void }).mockClear();
-    },
-  } satisfies PersistenceAdapter & { clear: () => void };
-  return adapter;
-};
 
 describe("Actor Shutdown", () => {
   let manager: ActorManager<typeof counterActorDef>;
@@ -117,13 +39,13 @@ describe("Actor Shutdown", () => {
     const actor = manager.get("shutdown-2");
     await actor.shutdown();
     await expect(actor.tell.Inc()).rejects.toThrow(
-      'Actor with id "shutdown-2" has been shut down. A new reference must be created via get().',
+      "Actor shutdown-2 is shutdown. Further messages are rejected.",
     );
   });
 
   it("should throw an error when streaming from a shutdown actor reference", async () => {
     const streamActorDef = defineActor("Streamer")
-      .withInitialState(() => ({}))
+      .initialState(() => ({}))
       .commands({
         DoStream: async function* (_state) {
           yield 1;
@@ -152,24 +74,42 @@ describe("Manager Shutdown", () => {
     expect(await actor.ask.Get()).toBe(1);
 
     await manager.shutdown();
-
-    await expect(actor.tell.Inc()).rejects.toThrow(
-      "ActorManager is shut down. Cannot interact with actors.",
-    );
-    await expect(actor.ask.Get()).rejects.toThrow(
-      "ActorManager is shut down. Cannot interact with actors.",
-    );
+    const expectedError =
+      "ActorManager is shut down. Cannot interact with actors.";
+    await expect(actor.tell.Inc()).rejects.toThrow(expectedError);
+    await expect(actor.ask.Get()).rejects.toThrow(expectedError);
 
     expect(() => manager.get("sys-down-2")).toThrow(
       "ActorManager is shut down. Cannot create new actors.",
     );
   });
 
+  it("should prevent streaming from any actor after manager shutdown", async () => {
+    const streamActorDef = defineActor("StreamerShutdown")
+      .initialState(() => ({}))
+      .commands({
+        DoStream: async function* (_state) {
+          yield 1;
+        },
+      })
+      .build();
+
+    const manager = createActorManager({ definition: streamActorDef });
+    const actor = manager.get("shutdown-stream-mgr-1");
+
+    await manager.shutdown();
+
+    const stream = actor.stream.DoStream()[Symbol.asyncIterator]();
+    await expect(stream.next()).rejects.toThrow(
+      "ActorManager is shut down. Cannot interact with actors.",
+    );
+  });
+
   it("should not affect persisted state, allowing a new manager to rehydrate", async () => {
-    const persistenceAdapter = createInMemoryPersistenceAdapter();
+    const store = createInMemoryPatchStore();
     const manager1 = createActorManager({
       definition: counterActorDef,
-      persistence: persistenceAdapter,
+      store: store,
     });
     const actorId = "sys-persist-1";
     const actor1 = manager1.get(actorId);
@@ -178,7 +118,7 @@ describe("Manager Shutdown", () => {
 
     const manager2 = createActorManager({
       definition: counterActorDef,
-      persistence: persistenceAdapter,
+      store: store,
     });
     const actor2 = manager2.get(actorId);
     const { state } = await actor2.inspect();
@@ -203,26 +143,26 @@ describe("Manager Shutdown", () => {
 });
 
 describe("Actor Shutdown with Persistence", () => {
-  const persistenceAdapter = createInMemoryPersistenceAdapter();
+  const store = createInMemoryPatchStore();
   let manager: ActorManager<typeof counterActorDef>;
 
   beforeEach(() => {
     manager = createActorManager({
       definition: counterActorDef,
-      persistence: persistenceAdapter,
+      store: store,
     });
   });
 
   afterEach(async () => {
     await manager.shutdown();
-    persistenceAdapter.clear();
+    store.clear();
   });
 
   it("should not clear persisted state on shutdown", async () => {
     const actorId = "shutdown-persist-1";
     const manager1 = createActorManager({
       definition: counterActorDef,
-      persistence: persistenceAdapter,
+      store: store,
     });
     const actor1 = manager1.get(actorId);
     await actor1.tell.Inc();
@@ -231,7 +171,7 @@ describe("Actor Shutdown with Persistence", () => {
 
     const manager2 = createActorManager({
       definition: counterActorDef,
-      persistence: persistenceAdapter,
+      store: store,
     });
     const actor2 = manager2.get(actorId);
     const { state, version } = await actor2.inspect();
@@ -243,13 +183,13 @@ describe("Actor Shutdown with Persistence", () => {
   it("should allow shutting down a failing-to-hydrate actor", async () => {
     const actorId = "shutdown-fail-hydrate";
     const loadError = new Error("DB Load Failed");
-    persistenceAdapter.load.mockRejectedValue(loadError);
+    store.load.mockRejectedValue(loadError);
     const actor = manager.get(actorId);
 
     await expect(actor.inspect()).rejects.toThrow(loadError);
     await expect(actor.shutdown()).resolves.toBeUndefined();
 
-    persistenceAdapter.load.mockResolvedValue(null);
+    store.load.mockResolvedValue({ snapshot: null, patches: [] });
     await expect(actor.inspect()).rejects.toThrow(
       `Actor with id "${actorId}" has been shut down. A new reference must be created via get().`,
     );
@@ -263,7 +203,7 @@ describe("Actor Shutdown with Persistence", () => {
       release = res;
     });
 
-    persistenceAdapter.load.mockImplementation(async () => {
+    store.load.mockImplementation(async () => {
       await lock;
       throw loadError;
     });
