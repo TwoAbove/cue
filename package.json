@@ -1,0 +1,41 @@
+{
+  "name": "cue",
+  "private": true,
+  "type": "module",
+  "version": "0.0.1",
+  "description": "Actor framework for building stateful applications",
+  "keywords": [
+    "actor",
+    "framework",
+    "stateful",
+    "application",
+    "typescript"
+  ],
+  "bugs": {
+    "url": "https://github.com/twoabove/cue/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/twoabove/cue.git"
+  },
+  "author": "Seva Maltsev <me@seva.dev> (https://seva.dev)",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "fast-json-patch": "^3.1.1",
+    "immer": "^10.1.1",
+    "superjson": "^2.2.2"
+  },
+  "scripts": {},
+  "devDependencies": {
+    "@biomejs/biome": "2.0.6",
+    "@types/node": "^20.19.2",
+    "@vitest/coverage-v8": "^3.2.4",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.4"
+  }
+}
