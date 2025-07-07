@@ -44,19 +44,19 @@ describe("Actor Coverage Tests", () => {
       await manager.shutdown();
     });
 
-    it("should handle restart strategy on error", async () => {
+    it("should handle reset strategy on error", async () => {
       const supervisor: Supervisor = {
-        strategy: vi.fn().mockReturnValue("restart"),
+        strategy: vi.fn().mockReturnValue("reset"),
       };
 
-      const definition = defineActor("RestartActor")
+      const definition = defineActor("ResetActor")
         .initialState(() => ({ counter: 0 }))
         .commands({
           increment: (state) => {
             state.counter++;
           },
           throwError: () => {
-            throw new Error("Restart test");
+            throw new Error("Reset test");
           },
         })
         .build();
@@ -66,16 +66,16 @@ describe("Actor Coverage Tests", () => {
         supervisor,
       });
 
-      const actor = manager.get("restart-test");
+      const actor = manager.get("reset-test");
 
       // Increment first
       await actor.tell.increment();
       expect((await actor.inspect()).state.counter).toBe(1);
 
-      // Error should trigger restart, resetting state
-      await expect(actor.tell.throwError()).rejects.toThrow("Restart test");
+      // Error should trigger reset, resetting state
+      await expect(actor.tell.throwError()).rejects.toThrow("Reset test");
 
-      // State should be reset after restart
+      // State should be reset after reset
       const state = await actor.inspect();
       expect(state.state.counter).toBe(0);
 

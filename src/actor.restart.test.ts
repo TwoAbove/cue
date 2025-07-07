@@ -12,7 +12,7 @@ describe("Actor restart behavior", () => {
 
   it("should prevent optimistic lock failure after restart", async () => {
     const supervisor: Supervisor = {
-      strategy: vi.fn().mockReturnValue("restart"),
+      strategy: vi.fn().mockReturnValue("reset"),
     };
 
     const definition = defineActor("RestartVersionTest")
@@ -53,12 +53,12 @@ describe("Actor restart behavior", () => {
     await manager.shutdown();
   });
 
-  it("should handle multiple operations after restart without lock failures", async () => {
+  it("should handle multiple operations after reset without lock failures", async () => {
     const supervisor: Supervisor = {
-      strategy: vi.fn().mockReturnValue("restart"),
+      strategy: vi.fn().mockReturnValue("reset"),
     };
 
-    const definition = defineActor("MultiOpRestartTest")
+    const definition = defineActor("MultiOpResetTest")
       .initialState(() => ({ counter: 0 }))
       .commands({
         increment: (state) => {

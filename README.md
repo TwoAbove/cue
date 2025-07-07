@@ -2,15 +2,15 @@
 
 A simple and robust actor framework for building stateful applications in TypeScript.
 
-Tired of state management turning into a chaotic drama? **Cue** is your application's poised director, bringing order and comfort to the stage. It orchestrates your application's state into standalone, persistent, and fault-tolerant actors that communicate through well-defined messages.
+Tired of state management turning into a chaotic drama? **Cue** is your application's poised **director**, bringing order and comfort to the stage. It orchestrates your application's state into standalone, persistent, and fault-tolerant **actors** that communicate through well-defined **messages**.
 
 ## Why Choose Cue?
 
 - **Effortless State, Seriously.** Powered by Immer, state updates are as simple and safe as direct mutation. Cue handles the complex plumbing, so you don't have to.
 - **Actor Model Made Easy.** Each actor has a private mailbox, processing commands sequentially. This ensures a clear, single-threaded, and replayable flow without manual locking.
-- **Fault-Tolerant by Design.** Gracefully handle errors with declarative supervision strategies (`resume`, `restart`, `stop`) without cluttering your business logic.
-- **Full Type-Safety Out of the Box.** Enjoy TypeScript's powerful type hints and error checking. Commands, queries, and their payloads have clear, reliable type boundaries.
-- **Robust Pluggable Persistence.** Actors can remember their state, gracefully surviving restarts. With a simple `PatchStore` interface, you can plug in any database you need.
+- **Fault-Tolerant by Design.** Gracefully handle errors with declarative supervision strategies (`resume`, `reset`, `stop`) without cluttering your business logic.
+- **Complete Type-Safety.** Enjoy TypeScript's powerful type hints and error checking. Commands, queries, and their payloads have clear, reliable type boundaries.
+- **Persistence Made Pluggable.** Actors can remember their state, gracefully surviving restarts. With a simple `PatchStore` interface, you can plug in any database you need.
 - **Seamless State Evolution.** Your application will change, and so will your state. Cue's upcasting mechanism lets you evolve actor state schemas over time with simple, pure functions—no complex data migrations required.
 - **Automatic Resource Management.** Built-in passivation automatically frees up memory for idle actors, keeping your application lean and scalable.
 - **Smart Serialization.** Automatically serialize and deserialize complex types like `Date`, `Map`, `Set`, `BigInt`, and `RegExp` right out of the box, powered by SuperJSON.
@@ -184,7 +184,7 @@ Simply chain `.evolveTo()` calls in your actor definition. When an actor with an
 
 ```typescript
 // V1 of our Character actor
-const CharacterV1 = defineActor("Character").initialState(() => ({
+const Character = defineActor("Character").initialState(() => ({
   name: "Player",
   hitPoints: 100,
 }));
@@ -192,7 +192,7 @@ const CharacterV1 = defineActor("Character").initialState(() => ({
 // Let's say we saved some actors with the V1 schema. Now, we need to change it.
 
 // V2 introduces a structured 'health' property
-const CharacterV2 = defineActor("Character")
+const Character = defineActor("Character")
   .initialState(() => ({
     // The V1 initial state is the starting point
     name: "Player",
@@ -211,6 +211,7 @@ const CharacterV2 = defineActor("Character")
     takeDamage: (state, amount: number) => {
       // Logic now uses the new state.health property
       state.health.current -= amount;
+      state.hitPoints; // This will error
     },
   })
   .build();
@@ -221,11 +222,29 @@ const CharacterV2 = defineActor("Character")
 
 ### Supervision: Fault Tolerance
 
-Actors can fail. The **supervisor** lets you define a clear, declarative strategy for handling errors without littering your business logic with try/catch blocks.
+What happens when an error occurs in the middle of a state update? In many systems, this can leave your application in a corrupt, unpredictable state. Cue solves this with a powerful, two-layered approach to fault tolerance:
 
-- **`resume`**: Ignores the error, keeping the actor's state as it was. The caller receives the error.
-- **`restart`**: Resets the actor to its initial state and continues. The caller receives a `RestartedError`.
-- **`stop`**: Shuts down the actor. It will enter a "failed" state and reject all future messages.
+1. **Transactional Updates:** When a command fails, all its attempted state changes are automatically rolled back. Your actor's state remains untouched and consistent, just as it was before the command ran. This eliminates a whole class of bugs related to partial updates.
+
+2. **Centralized Supervision:** With state consistency guaranteed, a **supervisor** decides the actor's fate. This decouples your business logic from your error recovery policy, letting you define clear, declarative strategies for different types of failures.
+
+A supervisor can choose one of three strategies, each suited for a different class of error:
+
+- **`resume`**: The actor's state is preserved, and the error is passed to the original caller.
+
+  - **When to use it:** For transient or input-related errors. The actor's internal state is still valid, but the specific operation failed. The actor is healthy and ready for the next message.
+  - **Example:** A `ValidationError` is thrown because a user tried to withdraw a negative amount from a bank account actor. The account's state is fine; the request was simply invalid.
+
+- **`stop`**: The actor is terminated and will reject all future messages.
+
+  - **When to use it:** For catastrophic, unrecoverable errors where even restarting is not a solution. This is for when the environment or configuration for an actor is broken.
+  - **Example:** An actor that relies on a specific API key fails because the key is missing or invalid. Restarting won't help, as the fundamental configuration is broken. Stopping the actor prevents it from running in a useless, error-prone state.
+
+- **`reset`**: The actor's state is reset to its initial value, as if it were brand new. The caller receives a `ResetError`.
+
+  - **Important!** If you are using a persistence store, this reset is also persisted. It effectively **wipes the actor's history and starts from a clean slate.** This is a powerful but destructive action that should be used only if something went **_really_** wrong.
+  - **When to use it:** When an actor's state is so corrupt that it's safer to start over entirely than to attempt recovery. It's the "hard reset" for a specific actor, used when you're willing to discard its accumulated data. The caller that triggered the error receives a specific `ResetError` to indicate what happened.
+  - **Example:** A ShoppingCart actor fails during checkout because a bug has allowed an invalid item ID to be added to its state. Attempting to process the order throws an InvalidCartStateError. Instead of leaving the user with a broken cart they can't empty or check out, the supervisor's `reset` strategy clears the cart, allowing the user to start again. **The loss of cart data is preferable to a permanent error state.**
 
 ```typescript
 import type { Supervisor } from "cue";
@@ -234,9 +253,16 @@ const mySupervisor: Supervisor = {
   strategy: (state, error) => {
     console.error(`Actor failed with state:`, state, `and error:`, error);
     if (error.name === "ValidationError") {
-      return "resume"; // Ignore validation errors, but let caller know
+      // The operation was invalid, but the actor is fine.
+      return "resume";
     }
-    return "restart"; // Restart on any other error
+    if (error.name === "CatastrophicConfigError") {
+      // The actor cannot function.
+      return "stop";
+    }
+    // For any other unexpected error, assume state may be corrupt.
+    // WARNING: This will discard the actor's persisted data.
+    return "reset";
   },
 };
 
@@ -244,6 +270,51 @@ const manager = createActorManager({
   definition: myActorDef,
   supervisor: mySupervisor,
 });
+```
+
+#### How Do You Recover from a `stop`?
+
+The `stop` strategy is a terminal state for a given actor instance, signaling an unrecoverable error. You cannot "un-stop" or resume a stopped actor. Think of it like a process that has crashed due to a fatal error—the process is gone, and you need to start a new one after fixing the problem.
+
+Recovery is a two-step process that happens outside the actor itself:
+
+1. **Fix the Root Cause:** A `stop` implies a fundamental problem with the actor's environment or configuration that a `resume` won't fix. This must be resolved externally.
+
+   - If the error was a bug, you need to **deploy new code**.
+   - If it was a missing API key, you need to **update your application's configuration or environment variables**.
+   - If it was a database connection issue, you need to **restore the database connection**.
+
+2. **Get a New Actor Reference:** Once the underlying problem is fixed, you can get a new, healthy actor reference. The simplest and most common way to do this is by **restarting your application**.
+
+When your application restarts, a new `ActorManager` is created. When you next call `manager.get("some-stopped-actor-id")`, the manager will create a _brand new_ actor instance. This new instance will attempt to hydrate from the persistence store. Since you've fixed the root cause, the hydration should now succeed, and you'll have a healthy, running actor.
+
+Here's a conceptual example:
+
+```typescript
+// --- In your application code ---
+const actor = manager.get("critical-actor");
+
+try {
+  await actor.tell.performCriticalTask();
+} catch (error) {
+  // Assume our supervisor has chosen 'stop' for this error
+  console.error(
+    "Actor 'critical-actor' was stopped. A fix and restart are required."
+  );
+  // At this point, you would typically alert your monitoring system.
+  // The 'actor' reference is now permanently failed.
+}
+
+// --- Later, after you've deployed a fix and restarted the app... ---
+
+// A new manager is created on app startup
+const newManager = createActorManager({
+  /*... your config ...*/
+});
+// Getting the actor by the same ID now works because the root cause is fixed.
+const newActorRef = newManager.get("critical-actor");
+// This will now succeed!
+await newActorRef.tell.performCriticalTask();
 ```
 
 ### Passivation: Automatic Resource Management

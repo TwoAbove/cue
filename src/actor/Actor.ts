@@ -13,7 +13,7 @@ import type {
   PatchStore,
   Supervisor,
 } from "../contracts";
-import { RestartedError } from "../contracts";
+import { ResetError } from "../contracts";
 import { clone, deepEqual, serializeComparable } from "../utils/serde";
 
 /**
@@ -74,7 +74,7 @@ export class Actor<TState extends Objectish> {
             case "resume":
               // Keep state, bubble error
               throw error;
-            case "restart": {
+            case "reset": {
               // Reset state and version
               // biome-ignore lint/suspicious/noExplicitAny: State can be any shape during migration
               let state: any = this.def._initialStateFn();
@@ -83,7 +83,7 @@ export class Actor<TState extends Objectish> {
               }
               this.state = state as TState;
               this.version = 0n;
-              // Persist the restart by committing a snapshot at version 0
+              // Persist the reset by committing a snapshot at version 0
               if (this.store?.commitSnapshot) {
                 try {
                   const latestSchemaVersion = this.def._upcasters.length + 1;
@@ -95,7 +95,7 @@ export class Actor<TState extends Objectish> {
                   // Ignore snapshot errors during restart
                 }
               }
-              throw new RestartedError(error as Error);
+              throw new ResetError(error as Error);
             }
             case "stop":
               await this.releaseLock();

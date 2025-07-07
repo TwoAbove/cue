@@ -34,15 +34,15 @@ export interface PatchStore {
   release?(actorId: string, owner: string): Promise<void>;
 }
 
-export class RestartedError extends Error {
+export class ResetError extends Error {
   constructor(original: Error) {
-    super(`Actor restarted after error: ${original.message}`);
+    super(`Actor reset after error: ${original.message}`);
     this.cause = original;
-    this.name = "RestartedError";
+    this.name = "ResetError";
   }
 }
 
-export type SupervisorStrategy = "resume" | "restart" | "stop";
+export type SupervisorStrategy = "resume" | "reset" | "stop";
 
 export interface Supervisor {
   strategy(state: unknown, error: Error): SupervisorStrategy;
