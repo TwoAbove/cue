@@ -19,7 +19,7 @@ Tired of state management turning into a chaotic drama? **Cue** is your applicat
 ## Installation
 
 ```bash
-npm install cue
+npm install <pending>
 ```
 
 ## A Five-Minute Introduction
