@@ -3,7 +3,7 @@
   "private": false,
   "type": "module",
   "main": "src/index.ts",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Actor framework for building stateful applications",
   "keywords": [
     "actor",

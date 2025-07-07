@@ -14,7 +14,7 @@ import type {
   StateOf,
   StreamProxyOf,
   TellProxyOf,
-} from "./contracts.ts";
+} from "./contracts";
 
 export type { Objectish } from "immer";
 export { Actor } from "./actor/Actor.js";
@@ -24,15 +24,26 @@ export type {
   ActorManagerConfig,
   ActorMetrics,
   ActorRef,
+  AnyActorDefinition,
+  AnyHandler,
   AskProxyOf,
+  CreateMessageMap,
+  Draft,
   Draftable,
   DraftStateOf,
+  InternalDefinitionFields,
+  MessagesOf,
+  Patch,
+  PatchStore,
+  PayloadOf,
   StateOf,
+  StateSnapshot,
   StreamProxyOf,
   Supervisor,
   SupervisorStrategy,
   TellProxyOf,
-} from "./contracts.ts";
+} from "./contracts";
+export { ResetError } from "./contracts";
 
 // --- Internal Types ---
 
