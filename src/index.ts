@@ -317,11 +317,6 @@ export function createActorManager<
     InternalDefinitionFields<TState>
 >;
 
-// Main implementation
-export function createActorManager<TDef extends AnyActorDefinition>(
-  config: ActorManagerConfig<TDef>,
-): ActorManager<TDef>;
-
 export function createActorManager<TDef extends AnyActorDefinition>(
   config: ActorManagerConfig<TDef>,
 ): ActorManager<TDef> {
