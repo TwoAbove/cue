@@ -3,7 +3,7 @@
   "private": false,
   "type": "module",
   "main": "src/index.ts",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Actor framework for building stateful applications",
   "keywords": [
     "actor",
@@ -26,21 +26,24 @@
     "LICENSE"
   ],
   "dependencies": {
-    "fast-json-patch": "^3.1.1",
     "immer": "^10.1.1",
     "superjson": "^2.2.2"
   },
   "scripts": {
+    "test:e2e": "sh ./scripts/e2e-test.sh",
     "test": "vitest run --coverage",
     "lint": "biome check",
     "build:types": "tsc -p tsconfig.build.json",
-    "prepublishOnly": "npm run build:types"
+    "prepublishOnly": "bun run build:types"
   },
   "devDependencies": {
     "@biomejs/biome": "2.0.6",
     "@types/node": "^20.19.2",
+    "@types/pg": "^8.15.4",
     "@vitest/coverage-v8": "^3.2.4",
     "expect-type": "^1.2.1",
+    "pg": "^8.16.3",
+    "pg-mem": "^3.0.5",
     "typescript": "^5.8.3",
     "vite": "^7.0.0",
     "vitest": "^3.2.4"

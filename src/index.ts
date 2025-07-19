@@ -1,5 +1,6 @@
 import type { Objectish } from "immer";
-import { Actor } from "./actor/Actor.js";
+import { enableMapSet, enablePatches } from "immer";
+import { Actor } from "./actor";
 import type {
   ActorDefinition,
   ActorManager,
@@ -7,17 +8,16 @@ import type {
   ActorRef,
   AnyActorDefinition,
   AnyHandler,
-  AskProxyOf,
+  AskProxy,
   CreateMessageMap,
   Draft,
   InternalDefinitionFields,
   StateOf,
-  StreamProxyOf,
-  TellProxyOf,
+  StreamProxy,
+  TellProxy,
 } from "./contracts";
 
-export type { Objectish } from "immer";
-export { Actor } from "./actor/Actor.js";
+export { Actor } from "./actor";
 export type {
   ActorDefinition,
   ActorManager,
@@ -26,26 +26,25 @@ export type {
   ActorRef,
   AnyActorDefinition,
   AnyHandler,
-  AskProxyOf,
+  AskProxy,
   CreateMessageMap,
   Draft,
-  Draftable,
-  DraftStateOf,
   InternalDefinitionFields,
   MessagesOf,
   Patch,
-  PatchStore,
   PayloadOf,
+  PersistenceAdapter,
   StateOf,
   StateSnapshot,
-  StreamProxyOf,
+  StreamProxy,
   Supervisor,
   SupervisorStrategy,
-  TellProxyOf,
+  TellProxy,
 } from "./contracts";
 export { ResetError } from "./contracts";
 
-// --- Internal Types ---
+enableMapSet();
+enablePatches();
 
 const IsAsyncGen = (fn: AnyHandler): boolean =>
   Object.prototype.toString.call(fn) === "[object AsyncGeneratorFunction]";
@@ -59,13 +58,11 @@ type HandlerEntry =
 
 type FullActorDefinition<
   TName extends string,
-  TState,
+  TState extends Objectish,
   TCommands extends Record<string, AnyHandler>,
   TQueries extends Record<string, AnyHandler>,
 > = ActorDefinition<TName, TState, CreateMessageMap<TCommands, TQueries>> &
   InternalDefinitionFields<TState>;
-
-// --- Actor Definition Builder ---
 
 class ActorDefinitionBuilder<
   TName extends string,
@@ -73,10 +70,6 @@ class ActorDefinitionBuilder<
   TCommands extends object = Record<string, never>,
   TQueries extends object = Record<string, never>,
 > {
-  private _persistenceConfig?: {
-    snapshotEvery?: number;
-  };
-
   constructor(
     private readonly name: TName,
     private readonly initialStateFn: () => object,
@@ -84,6 +77,9 @@ class ActorDefinitionBuilder<
     private readonly upcasters: ReadonlyArray<(prevState: any) => any>,
     private readonly commandsConfig: TCommands,
     private readonly queriesConfig: TQueries,
+    private _persistenceConfig?: {
+      snapshotEvery?: number;
+    },
   ) {}
 
   public evolveTo<TNewState extends Objectish>(
@@ -100,6 +96,7 @@ class ActorDefinitionBuilder<
       [...this.upcasters, upcaster],
       {},
       {},
+      this._persistenceConfig,
     );
   }
 
@@ -118,6 +115,7 @@ class ActorDefinitionBuilder<
       this.upcasters,
       { ...this.commandsConfig, ...newCommands },
       this.queriesConfig,
+      this._persistenceConfig,
     );
   }
 
@@ -136,12 +134,21 @@ class ActorDefinitionBuilder<
       this.upcasters,
       this.commandsConfig,
       { ...this.queriesConfig, ...newQueries },
+      this._persistenceConfig,
     );
   }
 
-  public persistence(config: { snapshotEvery?: number }) {
-    this._persistenceConfig = config;
-    return this;
+  public persistence(config: {
+    snapshotEvery?: number;
+  }): ActorDefinitionBuilder<TName, TState, TCommands, TQueries> {
+    return new ActorDefinitionBuilder(
+      this.name,
+      this.initialStateFn,
+      this.upcasters,
+      this.commandsConfig,
+      this.queriesConfig,
+      config,
+    );
   }
 
   public build(): FullActorDefinition<
@@ -175,11 +182,11 @@ class ActorDefinitionBuilder<
     return {
       _tag: "ActorDefinition",
       _name: this.name,
-      _state: null as unknown as TState, // Type carrier
+      _state: null as unknown as TState,
       _messages: null as unknown as CreateMessageMap<
         TCommands & Record<string, AnyHandler>,
         TQueries & Record<string, AnyHandler>
-      >, // Type carrier
+      >,
       _initialStateFn: this.initialStateFn,
       _upcasters: this.upcasters,
       _handlers: handlers,
@@ -202,30 +209,11 @@ export function defineActor<TName extends string>(name: TName) {
   };
 }
 
-// --- Typed Proxy Builders ---
-
-/**
- * Builds a tell proxy for fire-and-forget actor commands and streams.
- *
- * **Important streaming behavior**: When calling `tell.SomeStream()`, the stream
- * is eagerly drained to completion before returning the final value. This means:
- * - All yielded values are consumed but not returned to the caller
- * - Only the final return value from the stream is returned
- * - The stream runs to completion synchronously within the actor's mailbox
- *
- * If you need to consume individual yielded values, use the `stream` verb instead
- * of `tell` to get access to the AsyncGenerator.
- *
- * @param actor - The actor instance to proxy commands to
- * @param definition - The actor definition containing handler metadata
- * @param isShutdown - Function to check if the actor manager is shut down
- * @returns A proxy object with methods for each command and stream handler
- */
 function buildTellProxy<TDef extends AnyActorDefinition>(
   actor: Actor<StateOf<TDef>>,
   definition: TDef,
   isShutdown: () => boolean,
-): TellProxyOf<TDef> {
+): TellProxy<TDef> {
   const proxy: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
   for (const name in definition._handlers) {
@@ -258,14 +246,14 @@ function buildTellProxy<TDef extends AnyActorDefinition>(
     }
   }
 
-  return proxy as TellProxyOf<TDef>;
+  return proxy as TellProxy<TDef>;
 }
 
 function buildAskProxy<TDef extends AnyActorDefinition>(
   actor: Actor<StateOf<TDef>>,
   definition: TDef,
   isShutdown: () => boolean,
-): AskProxyOf<TDef> {
+): AskProxy<TDef> {
   const proxy: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
   for (const name in definition._handlers) {
@@ -282,14 +270,14 @@ function buildAskProxy<TDef extends AnyActorDefinition>(
     };
   }
 
-  return proxy as AskProxyOf<TDef>;
+  return proxy as AskProxy<TDef>;
 }
 
 function buildStreamProxy<TDef extends AnyActorDefinition>(
   actor: Actor<StateOf<TDef>>,
   definition: TDef,
   isShutdown: () => boolean,
-): StreamProxyOf<TDef> {
+): StreamProxy<TDef> {
   const proxy: Record<string, (...args: unknown[]) => AsyncIterable<unknown>> =
     {};
 
@@ -307,15 +295,12 @@ function buildStreamProxy<TDef extends AnyActorDefinition>(
     };
   }
 
-  return proxy as StreamProxyOf<TDef>;
+  return proxy as StreamProxy<TDef>;
 }
 
-// --- Actor Manager Implementation ---
-
-// Overload for inline actor definitions with better type inference
 export function createActorManager<
   const TName extends string,
-  TState,
+  TState extends Objectish,
   TCmds extends Record<string, HandlerFn>,
   TQs extends Record<string, HandlerFn>,
 >(
@@ -336,21 +321,21 @@ export function createActorManager<TDef extends AnyActorDefinition>(
 
   type TState = StateOf<TDef>;
 
-  // This map is now strongly typed with this manager's specific state type.
   const actors = new Map<string, Actor<TState>>();
+  const actorRefs = new Map<string, ActorRef<TDef>>();
   let isShutdown = false;
-  let sweeper: NodeJS.Timeout | undefined;
+  let sweeper: ReturnType<typeof setInterval> | undefined;
 
-  // Set up passivation if configured
   if (passivation) {
     const evictIdle = async () => {
       if (isShutdown) return;
 
       for (const [id, actor] of actors) {
         if (Date.now() - actor.lastActivity > passivation.idleAfter) {
-          await actor.maybeSnapshot();
-          await actor.shutdown();
+          await actor.maybeSnapshot(true);
+          await actor.terminate();
           actors.delete(id);
+          actorRefs.delete(id);
           metrics?.onEvict?.(id);
         }
       }
@@ -377,6 +362,7 @@ export function createActorManager<TDef extends AnyActorDefinition>(
         instanceUUID,
         supervisor,
         metrics,
+        config.lockTtlMs,
       );
       actors.set(id, actor);
     }
@@ -385,13 +371,24 @@ export function createActorManager<TDef extends AnyActorDefinition>(
 
   return {
     get(id: string): ActorRef<TDef> {
+      const existingRef = actorRefs.get(id);
+      if (existingRef) {
+        // If a ref exists, ensure its underlying actor is not failed or shutdown.
+        const actor = actors.get(id);
+        if (actor && !actor.isFailed && !actor.isShutdown) {
+          return existingRef;
+        }
+        // If actor is failed or gone, the ref is stale. Discard it and create a new one.
+        actorRefs.delete(id);
+      }
+
       const actor = getActor(id);
 
       const tellProxy = buildTellProxy(actor, definition, () => isShutdown);
       const askProxy = buildAskProxy(actor, definition, () => isShutdown);
       const streamProxy = buildStreamProxy(actor, definition, () => isShutdown);
 
-      return {
+      const actorRef: ActorRef<TDef> = {
         ask: askProxy,
         tell: tellProxy,
         stream: streamProxy,
@@ -403,13 +400,17 @@ export function createActorManager<TDef extends AnyActorDefinition>(
           }
           return actor.inspect();
         },
-        shutdown: async () => {
-          await actor.shutdown();
+        terminate: async () => {
+          await actor.terminate();
           actors.delete(id);
+          actorRefs.delete(id);
         },
       };
+
+      actorRefs.set(id, actorRef);
+      return actorRef;
     },
-    shutdown: async () => {
+    terminate: async () => {
       if (isShutdown) return;
       isShutdown = true;
 
@@ -419,10 +420,11 @@ export function createActorManager<TDef extends AnyActorDefinition>(
       }
 
       const shutdownPromises = [...actors.values()].map((actor) => {
-        return actor.shutdown();
+        return actor.terminate();
       });
       await Promise.allSettled(shutdownPromises);
       actors.clear();
+      actorRefs.clear();
     },
   };
 }

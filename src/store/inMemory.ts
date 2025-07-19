@@ -1,10 +1,14 @@
-import type { Patch, PatchStore, StateSnapshot } from "../contracts.js";
-import { clone } from "../utils/serde";
+import type { PersistenceAdapter } from "../contracts";
 
-interface ActorRecord {
+interface EventRecord {
   version: bigint;
-  snapshot?: { state: StateSnapshot; version: bigint };
-  patches: { version: bigint; patch: Patch }[];
+  data: string;
+  meta: string;
+}
+
+interface SnapshotRecord {
+  version: bigint;
+  data: string;
 }
 
 interface LockRecord {
@@ -12,66 +16,78 @@ interface LockRecord {
   expiresAt: number;
 }
 
-export class InMemoryStore implements PatchStore {
-  private actors = new Map<string, ActorRecord>();
+export class InMemoryPersistenceAdapter implements PersistenceAdapter {
+  private events = new Map<string, EventRecord[]>();
+  private snapshots = new Map<string, SnapshotRecord>();
   private locks = new Map<string, LockRecord>();
+  private latestVersions = new Map<string, bigint>();
 
-  async commit(
+  async getEvents(
     actorId: string,
-    expectedVersion: bigint,
-    patch: Patch,
-    _meta?: { handler: string; payload: unknown; returnVal?: unknown },
-  ): Promise<bigint> {
-    if (patch.length === 0) {
-      throw new Error("Empty patch: cannot commit an empty patch array");
-    }
+    fromVersion: bigint,
+  ): Promise<{ version: bigint; data: string; meta: string }[]> {
+    const actorEvents = this.events.get(actorId) || [];
+    return actorEvents
+      .filter((event) => event.version > fromVersion)
+      .map((event) => ({
+        version: event.version,
+        data: event.data,
+        meta: event.meta,
+      }));
+  }
 
-    const record = this.actors.get(actorId);
+  async commitEvent(
+    actorId: string,
+    version: bigint,
+    data: string,
+    meta: string,
+  ): Promise<void> {
+    const actorEvents = this.events.get(actorId) || [];
 
-    if (record && record.version !== expectedVersion) {
+    const latestEventVersion =
+      actorEvents[actorEvents.length - 1]?.version || 0n;
+    const latestSnapshotVersion = this.snapshots.get(actorId)?.version || 0n;
+    const actualCurrentVersion =
+      latestEventVersion > latestSnapshotVersion
+        ? latestEventVersion
+        : latestSnapshotVersion;
+
+    const expectedPrevVersion = version - 1n;
+
+    if (
+      expectedPrevVersion !== actualCurrentVersion &&
+      !(version === 0n && expectedPrevVersion === -1n)
+    ) {
       throw new Error(
-        `Optimistic lock failure: expected version ${expectedVersion}, got ${record.version}`,
+        `Optimistic lock failure: expected version ${expectedPrevVersion}, got ${actualCurrentVersion}`,
       );
     }
 
-    const newVersion = expectedVersion + 1n;
-
-    if (!record) {
-      this.actors.set(actorId, {
-        version: newVersion,
-        patches: [{ version: newVersion, patch }],
-      });
-    } else {
-      record.version = newVersion;
-      record.patches.push({ version: newVersion, patch });
-    }
-
-    return newVersion;
+    actorEvents.push({ version, data, meta });
+    this.events.set(actorId, actorEvents);
+    this.latestVersions.set(actorId, version);
   }
 
-  async load(
+  async getLatestSnapshot(
     actorId: string,
-    fromVersion = 0n,
-  ): Promise<{
-    snapshot: { state: StateSnapshot; version: bigint } | null;
-    patches: { version: bigint; patch: Patch }[];
-  }> {
-    const record = this.actors.get(actorId);
+  ): Promise<{ version: bigint; data: string } | null> {
+    const snapshot = this.snapshots.get(actorId);
+    return snapshot ? { version: snapshot.version, data: snapshot.data } : null;
+  }
 
-    if (!record) {
-      return {
-        snapshot: null,
-        patches: [],
-      };
-    }
+  async commitSnapshot(
+    actorId: string,
+    version: bigint,
+    data: string,
+  ): Promise<void> {
+    this.snapshots.set(actorId, { version, data });
+    this.latestVersions.set(actorId, version);
 
-    const snapshot = record.snapshot ? clone(record.snapshot) : null;
-    const patchesStartVersion = snapshot ? snapshot.version : fromVersion;
-    const patches = record.patches.filter(
-      (p) => p.version > patchesStartVersion,
+    const actorEvents = this.events.get(actorId) || [];
+    const eventsAfterSnapshot = actorEvents.filter(
+      (event) => event.version > version,
     );
-
-    return { snapshot, patches: clone(patches) };
+    this.events.set(actorId, eventsAfterSnapshot);
   }
 
   async acquire(
@@ -82,14 +98,12 @@ export class InMemoryStore implements PatchStore {
     const currentLock = this.locks.get(actorId);
     const now = Date.now();
 
-    // Check if lock exists and is not expired
     if (currentLock) {
       if (currentLock.expiresAt > now && currentLock.owner !== owner) {
-        return false; // Lock is held by someone else and not expired
+        return false;
       }
     }
 
-    // Acquire or renew the lock
     const expiresAt = ttlMs ? now + ttlMs : Number.MAX_SAFE_INTEGER;
     this.locks.set(actorId, { owner, expiresAt });
     return true;
@@ -103,34 +117,21 @@ export class InMemoryStore implements PatchStore {
     }
   }
 
-  async commitSnapshot(
-    actorId: string,
-    version: bigint,
-    snapshot: StateSnapshot,
-  ): Promise<void> {
-    const record = this.actors.get(actorId);
-
-    if (record) {
-      record.version = version;
-      record.snapshot = { state: clone(snapshot), version };
-      // Keep only patches after the snapshot version
-      record.patches = record.patches.filter((p) => p.version > version);
-    } else {
-      // Create new record with snapshot
-      this.actors.set(actorId, {
-        version,
-        snapshot: { state: clone(snapshot), version },
-        patches: [],
-      });
-    }
+  clear(): void {
+    this.events.clear();
+    this.snapshots.clear();
+    this.locks.clear();
+    this.latestVersions.clear();
   }
 
-  clear(): void {
-    this.actors.clear();
-    this.locks.clear();
+  async clearActor(actorId: string) {
+    this.events.delete(actorId);
+    this.snapshots.delete(actorId);
+    this.locks.delete(actorId);
+    this.latestVersions.delete(actorId);
   }
 }
 
-export function inMemoryStore(): PatchStore {
-  return new InMemoryStore();
+export function inMemoryPersistenceAdapter() {
+  return new InMemoryPersistenceAdapter();
 }

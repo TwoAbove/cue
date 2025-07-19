@@ -1,29 +1,20 @@
-import { applyPatch } from "fast-json-patch";
 import {
-  /* @__PURE__ */ createDraft,
+  applyPatches as applyImmerPatches,
+  createDraft,
   enablePatches,
   finishDraft,
   type Patch as ImmerPatch,
   type Objectish,
 } from "immer";
-
+import superjson from "superjson";
 import type {
   ActorMetrics,
   AnyActorDefinition,
-  PatchStore,
+  PersistenceAdapter,
   Supervisor,
-} from "../contracts";
-import { ResetError } from "../contracts";
-import { clone, deepEqual, serializeComparable } from "../utils/serde";
-
-/**
- * Escapes a JSON Pointer token according to RFC 6901.
- * '~' becomes '~0' and '/' becomes '~1'
- */
-function escapeJsonPointer(token: string | number): string {
-  const str = String(token);
-  return str.replace(/~/g, "~0").replace(/\//g, "~1");
-}
+} from "./contracts";
+import { ResetError } from "./contracts";
+import { clone, deepEqual } from "./utils/serde";
 
 type ActorStatus = "pending" | "hydrating" | "active" | "failed" | "shutdown";
 
@@ -39,15 +30,16 @@ export class Actor<TState extends Objectish> {
   private snapshotInProgress = false;
   private shutdownInProgress = false;
   private lockHeld = false;
-  private heartbeatInterval?: NodeJS.Timeout | undefined;
+  private heartbeatInterval?: ReturnType<typeof setInterval> | undefined;
 
   constructor(
     private readonly id: string,
     private readonly def: AnyActorDefinition,
-    private readonly store?: PatchStore,
+    private readonly store?: PersistenceAdapter,
     private readonly instanceUUID?: string,
     private readonly supervisor?: Supervisor,
     private readonly metrics?: ActorMetrics,
+    private readonly lockTtlMs: number = 30000,
   ) {
     this.lastTouch = Date.now();
     enablePatches();
@@ -59,6 +51,11 @@ export class Actor<TState extends Objectish> {
   }
 
   async enqueue<T>(task: () => Promise<T>): Promise<T> {
+    if (this.shutdownInProgress) {
+      throw new Error(
+        `Actor ${this.id} is shutting down. Further messages are rejected.`,
+      );
+    }
     if (this.status === "failed" || this.status === "shutdown") {
       throw new Error(
         `Actor ${this.id} is ${this.status}. Further messages are rejected.`,
@@ -68,40 +65,57 @@ export class Actor<TState extends Objectish> {
       try {
         return await task();
       } catch (error) {
+        this.metrics?.onError?.(this.id, error as Error);
         if (this.supervisor) {
           const strategy = this.supervisor.strategy(this.state, error as Error);
           switch (strategy) {
             case "resume":
-              // Keep state, bubble error
               throw error;
             case "reset": {
-              // Reset state and version
-              // biome-ignore lint/suspicious/noExplicitAny: State can be any shape during migration
-              let state: any = this.def._initialStateFn();
-              for (const upcaster of this.def._upcasters) {
-                state = upcaster(state);
-              }
-              this.state = state as TState;
-              this.version = 0n;
-              // Persist the reset by committing a snapshot at version 0
-              if (this.store?.commitSnapshot) {
+              if (this.store) {
                 try {
+                  if (typeof this.store.clearActor === "function") {
+                    await this.store.clearActor(this.id);
+                  }
+
                   const latestSchemaVersion = this.def._upcasters.length + 1;
-                  await this.store.commitSnapshot(this.id, 0n, {
+                  const snapshotData = {
                     schemaVersion: latestSchemaVersion,
-                    state: clone(this.state),
-                  });
-                } catch {
-                  // Ignore snapshot errors during restart
+                    actorDefName: this.def._name,
+                    state: clone(this.getLatestInitialState()),
+                  };
+
+                  await this.store.commitSnapshot(
+                    this.id,
+                    0n,
+                    superjson.stringify(snapshotData),
+                  );
+                } catch (persistenceError) {
+                  console.error(
+                    `Failed to persist reset for actor ${this.id}:`,
+                    persistenceError,
+                  );
+                  this.status = "failed";
+                  this.error = persistenceError as Error;
+                  this.metrics?.onError?.(this.id, persistenceError as Error);
+                  throw new Error(
+                    `Actor reset failed during persistence: ${
+                      persistenceError instanceof Error
+                        ? persistenceError.message
+                        : String(persistenceError)
+                    }`,
+                  );
                 }
               }
+              // Reset in-memory state *after* persistence succeeds
+              this.state = this.getLatestInitialState();
+              this.version = 0n;
               throw new ResetError(error as Error);
             }
             case "stop":
-              await this.releaseLock();
               this.status = "failed";
               this.error = error as Error;
-              this.metrics?.onError?.(this.id, error as Error);
+              await this.releaseLock();
               throw error;
           }
         }
@@ -109,14 +123,8 @@ export class Actor<TState extends Objectish> {
       }
     });
     this.mailbox = taskPromise.then(
-      () => {
-        // Clear reference to help GC
-        return undefined;
-      },
-      () => {
-        // Clear reference to help GC
-        return undefined;
-      },
+      () => undefined,
+      () => undefined,
     );
     return taskPromise;
   }
@@ -146,39 +154,29 @@ export class Actor<TState extends Objectish> {
     }
   }
 
-  private async hydrate(): Promise<void> {
-    const getLatestInitialState = (): TState => {
-      // biome-ignore lint/suspicious/noExplicitAny: State can be any shape during migration
-      let state: any = this.def._initialStateFn();
-      for (const upcaster of this.def._upcasters) {
-        state = upcaster(state);
-      }
-      return state as TState;
-    };
-
-    if (!this.store) {
-      this.state = getLatestInitialState();
-      this.version = 0n;
-      this.status = "active";
-      return;
+  private getLatestInitialState(): TState {
+    // biome-ignore lint/suspicious/noExplicitAny: State can be any shape during migration
+    let state: any = this.def._initialStateFn();
+    for (const upcaster of this.def._upcasters) {
+      state = upcaster(state);
     }
+    return state as TState;
+  }
 
+  private async hydrate(): Promise<void> {
     this.status = "hydrating";
     this.hydrationPromise = (async () => {
       try {
-        // acquire lock first (if supported)
         if (this.store?.acquire && this.instanceUUID) {
-          const ttlMs = 30000; // 30 seconds TTL
           const ok = await this.store.acquire(
             this.id,
             this.instanceUUID,
-            ttlMs,
+            this.lockTtlMs,
           );
           if (!ok)
             throw new Error(`Failed to acquire lock for actor ${this.id}`);
           this.lockHeld = true;
 
-          // Start heartbeat to keep the lock alive
           this.heartbeatInterval = setInterval(async () => {
             if (
               this.status === "active" &&
@@ -186,66 +184,28 @@ export class Actor<TState extends Objectish> {
               this.instanceUUID
             ) {
               try {
-                await this.store.acquire(this.id, this.instanceUUID, ttlMs);
+                await this.store.acquire(
+                  this.id,
+                  this.instanceUUID,
+                  this.lockTtlMs,
+                );
               } catch {
-                // Ignore heartbeat errors - the lock will expire naturally
+                // Ignore heartbeat errors
               }
             }
-          }, ttlMs / 2); // Heartbeat at half the TTL interval
+          }, this.lockTtlMs / 2);
+          this.heartbeatInterval.unref();
         }
 
-        const loaded = await this.store?.load(this.id, 0n);
-        if (loaded && (loaded.snapshot || loaded.patches.length > 0)) {
-          // biome-ignore lint/suspicious/noExplicitAny: State can be any shape during migration
-          let currentState: any;
-          let currentVersion = 0n;
-          let currentSchemaVersion = 1;
-
-          if (loaded.snapshot) {
-            const { schemaVersion, state: snapshotState } =
-              loaded.snapshot.state;
-            currentVersion = loaded.snapshot.version;
-            currentSchemaVersion = schemaVersion;
-            currentState = snapshotState;
-          } else {
-            // No snapshot, start from V1 initial state
-            currentState = this.def._initialStateFn();
-            currentVersion = 0n;
-            currentSchemaVersion = 1;
-          }
-
-          // Apply patches to the state (patches are always applied to their original schema version)
-          for (const patchEntry of loaded.patches) {
-            const stateAsJson = serializeComparable(currentState);
-            const patchResult = applyPatch(
-              // biome-ignore lint/suspicious/noExplicitAny: applyPatch requires any type for state
-              stateAsJson as any,
-              patchEntry.patch,
-            );
-
-            // Use clone to properly deserialize the patched state
-            currentState = clone(patchResult.newDocument);
-            currentVersion = patchEntry.version;
-          }
-
-          // Now run upcasters to migrate to the current schema version
-          const upcastersToRun = this.def._upcasters.slice(
-            currentSchemaVersion - 1,
-          );
-          for (const upcaster of upcastersToRun) {
-            currentState = upcaster(currentState);
-          }
-
-          this.state = currentState as TState;
-          this.version = currentVersion;
+        if (this.store) {
+          await this.hydrateFromPersistenceAdapter(this.store);
         } else {
-          this.state = getLatestInitialState();
+          this.state = this.getLatestInitialState();
           this.version = 0n;
         }
         this.status = "active";
         this.metrics?.onHydrate?.(this.id);
       } catch (error) {
-        // Ensure lock is released on hydration failure
         await this.releaseLock();
         this.status = "failed";
         this.error = error as Error;
@@ -257,7 +217,98 @@ export class Actor<TState extends Objectish> {
     await this.hydrationPromise;
   }
 
-  /** Releases the hydration lock (if we still own it) and stops the heartbeat */
+  private async hydrateFromPersistenceAdapter(
+    store: PersistenceAdapter,
+  ): Promise<void> {
+    // biome-ignore lint/suspicious/noExplicitAny: State can be any shape during migration
+    let currentState: any;
+    let currentVersion = 0n;
+    let currentSchemaVersion = 1;
+
+    const snapshotRecord = await store.getLatestSnapshot(this.id);
+    if (snapshotRecord) {
+      const snapshot = superjson.parse(snapshotRecord.data) as {
+        schemaVersion: number;
+        actorDefName?: string;
+        state: unknown;
+      };
+
+      if (snapshot.actorDefName && snapshot.actorDefName !== this.def._name) {
+        throw new Error(
+          `Definition mismatch: Actor '${this.id}' was created with definition '${snapshot.actorDefName}', but is being rehydrated with '${this.def._name}'.`,
+        );
+      }
+
+      currentState = snapshot.state;
+      currentVersion = snapshotRecord.version;
+      currentSchemaVersion = snapshot.schemaVersion;
+    } else {
+      currentState = this.def._initialStateFn();
+      currentVersion = 0n;
+      currentSchemaVersion = 1;
+    }
+
+    const eventRecords = await store.getEvents(this.id, currentVersion);
+
+    if (eventRecords.length > 0) {
+      // biome-ignore lint/style/noNonNullAssertion: length check ensures this exists
+      const firstEventMeta = superjson.parse(eventRecords[0]!.meta) as {
+        actorDefName?: string;
+      };
+      if (
+        firstEventMeta.actorDefName &&
+        firstEventMeta.actorDefName !== this.def._name
+      ) {
+        throw new Error(
+          `Definition mismatch: Actor '${this.id}' was created with definition '${firstEventMeta.actorDefName}', but is being rehydrated with '${this.def._name}'.`,
+        );
+      }
+    }
+
+    for (const eventRecord of eventRecords) {
+      const patches = superjson.parse(eventRecord.data) as ImmerPatch[];
+      currentState = applyImmerPatches(currentState, patches);
+      currentVersion = eventRecord.version;
+    }
+
+    const upcastersToRun = this.def._upcasters.slice(currentSchemaVersion - 1);
+    for (const upcaster of upcastersToRun) {
+      currentState = upcaster(currentState);
+    }
+
+    this.state = currentState as TState;
+    this.version = currentVersion;
+  }
+
+  private async _commitUpdate(
+    patches: ImmerPatch[],
+    meta: {
+      actorDefName: string;
+      handler: string;
+      payload: unknown;
+      returnVal?: unknown;
+    },
+  ): Promise<bigint> {
+    if (!this.store) {
+      throw new Error("Attempted to commit without a store.");
+    }
+    try {
+      const newVersion = this.version + 1n;
+      await this.store.commitEvent(
+        this.id,
+        newVersion,
+        superjson.stringify(patches),
+        superjson.stringify(meta),
+      );
+      return newVersion;
+    } catch (error) {
+      this.status = "failed";
+      this.error = error as Error;
+      await this.releaseLock();
+      throw error;
+    }
+  }
+
   private async releaseLock(): Promise<void> {
     if (!this.lockHeld) return;
     this.lockHeld = false;
@@ -287,7 +338,6 @@ export class Actor<TState extends Objectish> {
       let returnValue: unknown;
       let nextState: TState;
 
-      // Create a draft and execute the handler
       const draft = createDraft(currentState);
       try {
         returnValue = await Promise.resolve(entry.fn(draft, ...args));
@@ -295,44 +345,24 @@ export class Actor<TState extends Objectish> {
           immerPatches = patches;
         }) as TState;
       } catch (error) {
-        finishDraft(draft); // Clean up draft on error
+        finishDraft(draft);
         throw error;
       }
 
-      // If no patches were generated, the state didn't change
-      if (immerPatches.length === 0) {
-        return returnValue;
-      }
-
-      // Additional check: even if Immer generated patches, verify the state actually changed
-      // This handles cases where Immer generates patches for referentially different but
-      // semantically identical objects (e.g., Maps, Sets, Dates with same content)
-      if (!deepEqual(currentState, nextState)) {
-        // State actually changed, proceed with committing
-      } else {
-        // State is semantically identical, skip committing
+      if (immerPatches.length === 0 || deepEqual(currentState, nextState)) {
         return returnValue;
       }
 
       if (this.store) {
-        // Convert Immer patches to RFC-6902 format
-        const jsonPatch = immerPatches.map(
-          ({ op, path, value }: ImmerPatch) => ({
-            op,
-            path: `/${path.map(escapeJsonPointer).join("/")}`,
-            value,
-          }),
-        );
-
-        const newVersion = await this.store.commit(
-          this.id,
-          currentVersion,
-          jsonPatch,
-          { handler: handlerKey, payload: args, returnVal: returnValue },
-        );
+        const newVersion = await this._commitUpdate(immerPatches, {
+          actorDefName: this.def._name,
+          handler: handlerKey,
+          payload: args,
+          returnVal: returnValue,
+        });
         this.state = nextState as TState;
         this.version = newVersion;
-        this.metrics?.onAfterCommit?.(this.id, newVersion, jsonPatch);
+        this.metrics?.onAfterCommit?.(this.id, newVersion, immerPatches);
         await this.maybeSnapshot();
       } else {
         this.state = nextState as TState;
@@ -376,44 +406,27 @@ export class Actor<TState extends Objectish> {
       const generator = entry.fn(draftState, ...args) as AsyncGenerator;
       finalUpdate = yield* generator;
     } catch (error) {
-      finishDraft(draftState); // Clean up on error
-      throw error; // Propagate to caller
+      finishDraft(draftState);
+      throw error;
     }
     finalState = finishDraft(draftState, (patches) => {
       immerPatches = patches;
     }) as TState;
 
-    // If no patches were generated, the state didn't change
-    if (immerPatches.length === 0) {
-      return finalUpdate;
-    }
-
-    // Additional check: even if Immer generated patches, verify the state actually changed
-    // This handles cases where Immer generates patches for referentially different but
-    // semantically identical objects (e.g., Maps, Sets, Dates with same content)
-    if (!deepEqual(currentState, finalState)) {
-      // State actually changed, proceed with committing
-    } else {
-      // State is semantically identical, skip committing
+    if (immerPatches.length === 0 || deepEqual(currentState, finalState)) {
       return finalUpdate;
     }
 
     if (this.store) {
-      const jsonPatch = immerPatches.map(({ op, path, value }: ImmerPatch) => ({
-        op,
-        path: `/${path.map(escapeJsonPointer).join("/")}`,
-        value,
-      }));
-
-      const newVersion = await this.store.commit(
-        this.id,
-        currentVersion,
-        jsonPatch,
-        { handler: handlerKey, payload: args, returnVal: finalUpdate },
-      );
+      const newVersion = await this._commitUpdate(immerPatches, {
+        actorDefName: this.def._name,
+        handler: handlerKey,
+        payload: args,
+        returnVal: finalUpdate,
+      });
       this.state = finalState as TState;
       this.version = newVersion;
-      this.metrics?.onAfterCommit?.(this.id, newVersion, jsonPatch);
+      this.metrics?.onAfterCommit?.(this.id, newVersion, immerPatches);
       await this.maybeSnapshot();
     } else {
       this.state = finalState as TState;
@@ -430,11 +443,13 @@ export class Actor<TState extends Objectish> {
     };
   }
 
-  async shutdown(): Promise<void> {
+  async terminate(): Promise<void> {
     if (this.shutdownInProgress || this.status === "shutdown") {
       return;
     }
     this.shutdownInProgress = true;
+
+    await this.mailbox.catch(() => {});
 
     if (this.status === "hydrating" && this.hydrationPromise) {
       try {
@@ -448,12 +463,14 @@ export class Actor<TState extends Objectish> {
     await this.releaseLock();
   }
 
-  async maybeSnapshot(): Promise<void> {
+  async maybeSnapshot(force = false): Promise<void> {
     if (
       this.snapshotInProgress ||
       this.status === "shutdown" ||
       !this.def._persistence?.snapshotEvery ||
-      this.version % BigInt(this.def._persistence.snapshotEvery) !== 0n ||
+      this.version === 0n ||
+      (!force &&
+        this.version % BigInt(this.def._persistence.snapshotEvery) !== 0n) ||
       !this.store
     ) {
       return;
@@ -463,10 +480,18 @@ export class Actor<TState extends Objectish> {
     try {
       this.metrics?.onBeforeSnapshot?.(this.id, this.version);
       const latestSchemaVersion = this.def._upcasters.length + 1;
-      await this.store.commitSnapshot(this.id, this.version, {
+      const snapshotData = {
         schemaVersion: latestSchemaVersion,
+        actorDefName: this.def._name,
         state: clone(this.currentState),
-      });
+      };
+
+      await this.store.commitSnapshot(
+        this.id,
+        this.version,
+        superjson.stringify(snapshotData),
+      );
+
       this.metrics?.onSnapshot?.(this.id, this.version);
     } catch {
       // It's a non-critical error, so we swallow it to not fail the operation.
@@ -481,5 +506,9 @@ export class Actor<TState extends Objectish> {
 
   get isFailed(): boolean {
     return this.status === "failed";
+  }
+
+  get isShutdown(): boolean {
+    return this.status === "shutdown" || this.shutdownInProgress;
   }
 }
