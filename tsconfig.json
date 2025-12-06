@@ -10,6 +10,7 @@
     "noUncheckedIndexedAccess": true,
     "noPropertyAccessFromIndexSignature": true,
     "noImplicitOverride": true,
+    "noImplicitAny": true,
     "useUnknownInCatchVariables": true,
     "skipLibCheck": true,
     "baseUrl": "./",
@@ -20,6 +21,6 @@
     "types": ["node"],
     "composite": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "include": ["src/**/*.ts", "test/**/*.ts", "test.old/**/*.ts"],
   "exclude": ["node_modules", "dist", "coverage"]
 }

@@ -25,7 +25,7 @@ done
 
 # Run the E2E tests
 echo "Running E2E tests..."
-E2E=true POSTGRES_URL="postgresql://postgres:postgres@localhost:5433/cue_test" bunx vitest src/persistence.e2e.test.ts --run
+E2E=true POSTGRES_URL="postgresql://postgres:postgres@localhost:5433/cue_test" bunx vitest test/e2e/postgres.persistence.e2e.test.ts --run
 
 # Clean up
 echo "Stopping PostgreSQL..."
