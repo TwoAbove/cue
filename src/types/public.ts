@@ -1,4 +1,4 @@
-import type { createDraft, Patch as ImmerPatch } from "immer";
+import type { Draft as ImmerDraft, Patch as ImmerPatch } from "immer";
 import type { PersistenceAdapter } from "../persistence/types";
 import type {
   _handlers,
@@ -15,9 +15,7 @@ import type {
 // biome-ignore lint/suspicious/noExplicitAny: This is intentional for a generic handler type
 export type AnyHandler = (...args: any[]) => any;
 export type Patch = readonly ImmerPatch[];
-export type Draft<T> = T extends object
-  ? ReturnType<typeof createDraft<T>>
-  : never;
+export type Draft<T> = ImmerDraft<T>;
 
 export interface HandlerContext {
   self: { id: string; isFailed: boolean };
