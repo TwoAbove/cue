@@ -1,8 +1,7 @@
+export type { Draft, Immutable } from "immer";
 export * from "./api/index";
 export * from "./errors/index";
 export type * from "./persistence/types";
-
-// We export internal symbols so TypeScript can serialize EntityDefinition in consumer declaration files
 export {
   _handlers,
   _initialStateFn,
