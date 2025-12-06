@@ -117,6 +117,20 @@ export type InternalDefinitionFields<TState extends object = object> = {
   readonly [_persistence]?: { snapshotEvery?: number };
 };
 
+export type BuiltEntityDefinition<
+  TName extends string = string,
+  TState extends object = object,
+  TMessages extends MessageMap = MessageMap,
+  TVersions extends object[] = object[],
+> = EntityDefinition<TName, TState, TMessages> & {
+  readonly [_initialStateFn]: () => TVersions[0];
+  // biome-ignore lint/suspicious/noExplicitAny: upcasters handle any previous state
+  readonly [_upcasters]: ReadonlyArray<(prevState: any) => any>;
+  readonly [_handlers]: Record<string, HandlerEntry>;
+  readonly [_versions]: TVersions;
+  readonly [_persistence]?: { snapshotEvery?: number };
+};
+
 export type StateOf<TDef extends AnyEntityDefinition> = TDef[typeof _state];
 export type MessagesOf<TDef extends AnyEntityDefinition> =
   TDef[typeof _messages];

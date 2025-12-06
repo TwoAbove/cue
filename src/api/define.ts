@@ -11,6 +11,7 @@ import {
 } from "../types/internal";
 import type {
   AnyHandler,
+  BuiltEntityDefinition,
   CreateMessageMap,
   Draft,
   HandlerEntry,
@@ -112,7 +113,12 @@ class DefinitionBuilder<
     return this;
   }
 
-  public build() {
+  public build(): BuiltEntityDefinition<
+    TName,
+    TState,
+    CreateMessageMap<TCommands & {}, TQueries & {}>,
+    TVersions
+  > {
     const handlers: Record<string, HandlerEntry> = {};
     for (const [key, fn] of Object.entries(this.commandsConfig)) {
       handlers[key] = { type: IsAsyncGen(fn) ? "stream" : "command", fn };
@@ -135,7 +141,12 @@ class DefinitionBuilder<
       [_versions]: null as unknown as TVersions,
       ...(this.persistenceConfig && { [_persistence]: this.persistenceConfig }),
     };
-    return definition;
+    return definition as BuiltEntityDefinition<
+      TName,
+      TState,
+      CreateMessageMap<TCommands & {}, TQueries & {}>,
+      TVersions
+    >;
   }
 }
 
