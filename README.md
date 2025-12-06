@@ -37,8 +37,10 @@ console.log(await counter.read.value()); // 5
 ## Installation
 
 ```bash
-npm install @twoabove/cue
+npm install @twoabove/cue immer
 ```
+
+> **Note:** `immer` is a peer dependency and must be installed alongside cue.
 
 ## Quick Start
 

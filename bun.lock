@@ -1,10 +1,10 @@
 {
   "lockfileVersion": 1,
+  "configVersion": 0,
   "workspaces": {
     "": {
       "name": "cue",
       "dependencies": {
-        "immer": "^10.2.0",
         "superjson": "^2.2.3",
       },
       "devDependencies": {
@@ -13,11 +13,14 @@
         "@types/pg": "^8.15.5",
         "@vitest/coverage-v8": "^4.0.4",
         "expect-type": "^1.2.2",
+        "immer": "^10.2.0",
         "pg": "^8.16.3",
         "pg-mem": "^3.0.5",
         "typescript": "^5.9.3",
-        "vite": "^7.1.12",
         "vitest": "^4.0.4",
+      },
+      "peerDependencies": {
+        "immer": ">=10.0.0",
       },
     },
   },
