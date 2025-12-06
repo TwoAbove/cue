@@ -5,7 +5,7 @@
 Define entities with state, commands, and queries. Cue handles persistence, concurrency, and schema evolution—so you don't have to.
 
 ```typescript
-import { define, create } from "cue";
+import { define, create } from "@twoabove/cue";
 
 const Counter = define("Counter")
   .initialState(() => ({ count: 0 }))
@@ -37,13 +37,13 @@ console.log(await counter.read.value()); // 5
 ## Installation
 
 ```bash
-npm install cue
+npm install @twoabove/cue
 ```
 
 ## Quick Start
 
 ```typescript
-import { create, define, memoryStore } from "cue";
+import { create, define, memoryStore } from "@twoabove/cue";
 
 // 1. Define your entity
 const Character = define("Character")
@@ -155,7 +155,7 @@ await ref.stop(); // Manually stop this entity
 Provide a store to persist state changes:
 
 ```typescript
-import { create, memoryStore } from "cue";
+import { create, memoryStore } from "@twoabove/cue";
 
 const manager = create({
   definition: Character,
@@ -218,7 +218,7 @@ When an old entity loads, Cue automatically runs upcasters to migrate its state.
 Query historical state at any event version with full type safety:
 
 ```typescript
-import { create, define, type HistoryOf, type VersionState } from "cue";
+import { create, define, type HistoryOf, type VersionState } from "@twoabove/cue";
 
 const Character = define("Character")
   .initialState(() => ({ hp: 100 }))
@@ -279,7 +279,7 @@ This enables building debug UIs, audit logs, and replay systems with compile-tim
 Handle errors declaratively:
 
 ```typescript
-import { create, supervisor } from "cue";
+import { create, supervisor } from "@twoabove/cue";
 
 const mySupervisor = supervisor({
   stop: (_state, err) => err.name === "CatastrophicError",
@@ -398,7 +398,7 @@ ref.stop(); // Stop and release this entity
 ### Type Utilities
 
 ```typescript
-import { HistoryOf, VersionState, StateOf } from "cue";
+import { HistoryOf, VersionState, StateOf } from "@twoabove/cue";
 
 type History = HistoryOf<typeof Entity>; // Discriminated union of all versions
 type V2State = VersionState<typeof Entity, 2>; // State type at schema version 2
