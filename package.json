@@ -4,7 +4,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -50,6 +50,7 @@
     "superjson": "^2.2.3"
   },
   "scripts": {
+    "prepare": "bun run build",
     "test:e2e": "sh ./scripts/e2e-test.sh",
     "test": "vitest run --coverage",
     "lint": "biome check",
