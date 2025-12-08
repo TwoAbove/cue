@@ -5,6 +5,7 @@ import {
   type Patch as ImmerPatch,
   isDraft,
 } from "immer";
+import { clone } from "../serde";
 import { _handlers } from "../types/internal";
 import type {
   AnyEntityDefinition,
@@ -63,7 +64,6 @@ export class StateKernel<TState extends object> {
       state = applyPatches(state, event.patches as ImmerPatch[]);
     }
 
-    // Upcast to latest schema version
     this.#state = Evolution.applyUpcasters(state, currentSchema, this.def);
     this.#version = params.baseVersion + BigInt(params.events.length);
   }
@@ -112,9 +112,10 @@ export class StateKernel<TState extends object> {
 
     const draft = createDraft(this.state);
     try {
-      return entry.fn(draft, ...args, ctx);
+      const result = entry.fn(draft, ...args, ctx);
+      return clone(result);
     } finally {
-      finishDraft(draft); // discards changes
+      finishDraft(draft);
     }
   }
 
