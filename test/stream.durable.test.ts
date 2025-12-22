@@ -96,6 +96,7 @@ describe("Durable Streams", () => {
     expect(status).toEqual({
       state: "complete",
       seq: 2n,
+      returnValue: 2,
     });
 
     await manager.stop();
@@ -165,7 +166,7 @@ describe("Durable Streams", () => {
     await manager.stop();
   });
 
-  it("early break still commits partial stream to storage", async () => {
+  it("producer continues to completion after consumer breaks (detached)", async () => {
     const store = new InMemoryPersistenceAdapter();
     const manager = create({ definition: Counter, store });
     const ref = manager.get(newId());
@@ -179,10 +180,19 @@ describe("Durable Streams", () => {
       if (count === 2) break;
     }
 
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 50));
 
     const status = await manager.streamStatus(streamId);
     expect(status?.state).toBe("complete");
+    expect(status?.returnValue).toBe(5);
+
+    const reader = manager.readStream<{ i: number; n: number }>(streamId);
+    const chunks: Array<{ seq: bigint; data: { i: number; n: number } }> = [];
+    for await (const chunk of reader) {
+      chunks.push(chunk);
+    }
+    expect(chunks).toHaveLength(5);
+    expect(chunks[4]).toEqual({ seq: 5n, data: { i: 5, n: 5 } });
 
     await manager.stop();
   });

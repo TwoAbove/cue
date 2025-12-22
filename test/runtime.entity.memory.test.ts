@@ -54,7 +54,7 @@ describe("Entity (in-memory store)", () => {
     await manager.stop();
   });
 
-  it("streaming: early return commits partial progress; draining via send returns final value", async () => {
+  it("streaming: early return still runs producer to completion (detached streams)", async () => {
     const store = new InMemoryPersistenceAdapter();
     const manager = create({ definition: Counter, store });
     const ref = manager.get(newId());
@@ -66,11 +66,14 @@ describe("Entity (in-memory store)", () => {
       break;
     }
     expect(seen).toBe(1);
-    expect(await ref.read.get()).toBe(1);
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(await ref.read.get()).toBe(3);
 
     const final = await ref.send.streamGrow(2);
-    expect(final).toBe(3);
-    expect(await ref.read.get()).toBe(3);
+    expect(final).toBe(5);
+    expect(await ref.read.get()).toBe(5);
 
     await manager.stop();
   });

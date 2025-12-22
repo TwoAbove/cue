@@ -156,18 +156,14 @@ export class Entity<TState extends object> {
 
     type ChannelItem =
       | { type: "value"; value: unknown }
-      | { type: "done" }
+      | { type: "done"; returnValue: unknown }
       | { type: "error"; error: unknown };
 
     const channel: ChannelItem[] = [];
     let consumerWaiting: ((item: ChannelItem) => void) | null = null;
-    let producerWaiting: {
-      resolve: () => void;
-      reject: (e: Error) => void;
-    } | null = null;
-    let aborted = false;
     let currentSeq = 0n;
     let isLive = true;
+    let producerDone = false;
 
     function push(item: ChannelItem) {
       if (consumerWaiting) {
@@ -187,23 +183,6 @@ export class Entity<TState extends object> {
       });
     }
 
-    function signalProducerContinue() {
-      if (producerWaiting) {
-        const { resolve } = producerWaiting;
-        producerWaiting = null;
-        resolve();
-      }
-    }
-
-    function signalProducerAbort() {
-      aborted = true;
-      if (producerWaiting) {
-        const { reject } = producerWaiting;
-        producerWaiting = null;
-        reject(new Error("stream aborted"));
-      }
-    }
-
     async function commitStreamChunk(value: unknown): Promise<void> {
       if (!self.store) return;
       currentSeq += 1n;
@@ -218,15 +197,10 @@ export class Entity<TState extends object> {
     }
 
     async function commitStreamEnd(
-      state: "complete" | "error",
-      error?: string,
+      payload: StreamEndEnvelope["payload"][0],
     ): Promise<void> {
       if (!self.store) return;
       currentSeq += 1n;
-      const payload: StreamEndEnvelope["payload"][0] = { state };
-      if (error) {
-        payload.error = error;
-      }
       const envelope: StreamEndEnvelope = {
         entityDefName: STREAM_ENTITY_DEF_NAME,
         schemaVersion: STREAM_SCHEMA_VERSION,
@@ -245,31 +219,32 @@ export class Entity<TState extends object> {
         self.buildContext(),
       );
 
+      let finalReturn: unknown;
       try {
-        for await (const value of stream.generator) {
-          await commitStreamChunk(value);
-          push({ type: "value", value });
-          await new Promise<void>((resolve, reject) => {
-            producerWaiting = { resolve, reject };
-          });
+        while (true) {
+          const result = await stream.generator.next();
+          if (result.done) {
+            finalReturn = result.value;
+            break;
+          }
+          await commitStreamChunk(result.value);
+          push({ type: "value", value: result.value });
         }
-        push({ type: "done" });
-        await commitStreamEnd("complete");
+        producerDone = true;
+        push({ type: "done", returnValue: finalReturn });
+        await commitStreamEnd({ state: "complete", returnValue: finalReturn });
       } catch (e) {
-        if (!aborted) {
-          stream.discard();
-          const errorMsg = e instanceof Error ? e.message : String(e);
-          await commitStreamEnd("error", errorMsg);
-          push({ type: "error", error: e });
-          return;
-        }
-        // If aborted by consumer, still write end event
-        await commitStreamEnd("complete");
+        stream.discard();
+        producerDone = true;
+        const errorMsg = e instanceof Error ? e.message : String(e);
+        await commitStreamEnd({ state: "error", error: errorMsg });
+        push({ type: "error", error: e });
+        return;
       }
 
       const { patches, nextState } = stream.finalize();
       if (patches.length > 0) {
-        await self.commit(handlerName, args, undefined, patches, nextState);
+        await self.commit(handlerName, args, finalReturn, patches, nextState);
       }
     });
 
@@ -286,12 +261,12 @@ export class Entity<TState extends object> {
             throw item.error;
           }
           yield item.value;
-          signalProducerContinue();
         }
       } finally {
-        signalProducerAbort();
-        await mailboxTask;
         isLive = false;
+        if (!producerDone) {
+          await mailboxTask;
+        }
       }
     }
 

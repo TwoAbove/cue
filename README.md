@@ -220,9 +220,13 @@ Check stream status without consuming:
 ```typescript
 const status = await manager.streamStatus(streamId);
 // { state: 'running', seq: 42n }
-// { state: 'complete', seq: 100n }
+// { state: 'complete', seq: 100n, returnValue: { report: ... } }
 // { state: 'error', seq: 50n, error: 'timeout' }
 ```
+
+The `returnValue` field contains the generator's return value once complete.
+
+**Note:** The entity is locked during stream execution (one operation at a time). Other commands to the same entity will queue until the stream finishes. This ensures consistency but means long streams block other operations on that entity.
 
 This is essential for AI assistants, file processors, report generators - any operation that takes longer than a network timeout.
 

@@ -30,14 +30,18 @@ export async function streamStatus(
 
   if (envelope.handler === "end") {
     const endPayload = envelope.payload[0];
-    const status: StreamStatus = {
-      state: endPayload.state,
-      seq: BigInt(events.length - 1),
-    };
-    if (endPayload.error) {
-      status.error = endPayload.error;
+    if (endPayload.state === "error") {
+      return {
+        state: "error",
+        seq: BigInt(events.length - 1),
+        error: endPayload.error,
+      };
     }
-    return status;
+    return {
+      state: "complete",
+      seq: BigInt(events.length - 1),
+      returnValue: endPayload.returnValue,
+    };
   }
 
   return {

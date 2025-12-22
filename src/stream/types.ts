@@ -7,6 +7,7 @@ export interface StreamStatus {
   state: "running" | "complete" | "error";
   seq: bigint;
   error?: string;
+  returnValue?: unknown;
 }
 
 export interface StreamRun<T> extends AsyncIterable<T> {
@@ -31,11 +32,15 @@ export interface StreamChunkEnvelope {
   patches: readonly [];
 }
 
+export type StreamEndPayload =
+  | { state: "complete"; returnValue?: unknown }
+  | { state: "error"; error: string };
+
 export interface StreamEndEnvelope {
   entityDefName: "__stream__";
   schemaVersion: 1;
   handler: "end";
-  payload: [{ state: "complete" | "error"; error?: string }];
+  payload: [StreamEndPayload];
   patches: readonly [];
 }
 
