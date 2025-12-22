@@ -1,6 +1,7 @@
 import { ManagerShutdownError } from "../errors";
 import type { Entity } from "../runtime/Entity";
 import { RuntimeEntityManager } from "../runtime/EntityManager";
+import { readStream, streamStatus } from "../stream/reader";
 import type {
   AnyEntityDefinition,
   EntityManager,
@@ -8,9 +9,12 @@ import type {
   EntityRef,
   HistoryOf,
   ReadProxy,
+  ReadStreamOptions,
   SendProxy,
   StateOf,
   StreamProxy,
+  StreamReader,
+  StreamStatus,
 } from "../types/public";
 
 export function create<TDef extends AnyEntityDefinition>(
@@ -107,7 +111,11 @@ export function create<TDef extends AnyEntityDefinition>(
   return {
     get(id: string): EntityRef<TDef> {
       const existing = entries.get(id);
-      if (existing && !existing.entity.isFailed && !existing.entity.isShutdown) {
+      if (
+        existing &&
+        !existing.entity.isFailed &&
+        !existing.entity.isShutdown
+      ) {
         return existing.ref;
       }
 
@@ -159,6 +167,24 @@ export function create<TDef extends AnyEntityDefinition>(
       entries.set(id, entry);
       return ref;
     },
+
+    readStream<T = unknown>(
+      streamId: string,
+      options?: ReadStreamOptions,
+    ): StreamReader<T> {
+      if (!config.store) {
+        throw new Error("readStream requires a persistence store");
+      }
+      return readStream<T>(config.store, streamId, options);
+    },
+
+    async streamStatus(streamId: string): Promise<StreamStatus | null> {
+      if (!config.store) {
+        throw new Error("streamStatus requires a persistence store");
+      }
+      return streamStatus(config.store, streamId);
+    },
+
     stop: () => manager.terminate(),
   };
 }

@@ -1,6 +1,13 @@
 import type { Draft as ImmerDraft, Patch as ImmerPatch } from "immer";
 import type { PersistenceAdapter } from "../persistence/types";
 import type {
+  ReadStreamOptions as _ReadStreamOptions,
+  StreamChunk as _StreamChunk,
+  StreamReader as _StreamReader,
+  StreamRun as _StreamRun,
+  StreamStatus as _StreamStatus,
+} from "../stream/types";
+import type {
   _handlers,
   _initialStateFn,
   _messages,
@@ -11,6 +18,12 @@ import type {
   _upcasters,
   _versions,
 } from "./internal";
+
+export type ReadStreamOptions = _ReadStreamOptions;
+export type StreamChunk<T> = _StreamChunk<T>;
+export type StreamReader<T> = _StreamReader<T>;
+export type StreamRun<T> = _StreamRun<T>;
+export type StreamStatus = _StreamStatus;
 
 // biome-ignore lint/suspicious/noExplicitAny: This is intentional for a generic handler type
 export type AnyHandler = (...args: any[]) => any;
@@ -72,7 +85,7 @@ export type CreateQueryMessage<THandler extends AnyHandler> = {
 
 export type CreateMessageMap<
   TCommands extends Record<string, AnyHandler>,
-  TQueries extends Record<string, AnyHandler>
+  TQueries extends Record<string, AnyHandler>,
 > = {
   [K in keyof TCommands]: CreateCommandMessage<TCommands[K]>;
 } & {
@@ -83,7 +96,7 @@ export type CreateMessageMap<
 export type EntityDefinition<
   TName extends string,
   TState,
-  TMessages extends MessageMap
+  TMessages extends MessageMap,
 > = {
   readonly [_name]: TName;
   readonly [_state]: TState;
@@ -158,7 +171,7 @@ export type StreamProxy<TDef extends AnyEntityDefinition> = {
     ? K
     : never]: (
     ...args: MessagesOf<TDef>[K]["payload"]
-  ) => AsyncIterable<MessagesOf<TDef>[K]["progress"]>;
+  ) => StreamRun<MessagesOf<TDef>[K]["progress"]>;
 };
 
 export type EntityRef<TDef extends AnyEntityDefinition> = {
@@ -200,6 +213,11 @@ export interface EntityManagerConfig<TDef extends AnyEntityDefinition> {
 
 export interface EntityManager<TDef extends AnyEntityDefinition> {
   get(id: string): EntityRef<TDef>;
+  readStream<T = unknown>(
+    streamId: string,
+    options?: ReadStreamOptions,
+  ): StreamReader<T>;
+  streamStatus(streamId: string): Promise<StreamStatus | null>;
   stop(): Promise<void>;
 }
 
@@ -215,7 +233,7 @@ export interface EntityManager<TDef extends AnyEntityDefinition> {
  */
 type BuildHistoryUnion<
   Versions extends object[],
-  Counter extends unknown[] = [unknown]
+  Counter extends unknown[] = [unknown],
 > = Versions extends [infer Head extends object, ...infer Tail extends object[]]
   ?
       | { schemaVersion: Counter["length"]; state: Head }
@@ -240,7 +258,7 @@ export type HistoryOf<TDef extends AnyEntityDefinition> = TDef extends {
  */
 export type VersionState<
   TDef extends AnyEntityDefinition,
-  V extends number
+  V extends number,
 > = Extract<HistoryOf<TDef>, { schemaVersion: V }>["state"];
 
 /** The initial state shape (schema version 1). */

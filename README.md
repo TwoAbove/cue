@@ -31,7 +31,7 @@ console.log(await counter.read.value()); // 5
 - **Durable.** State survives restarts. Plug in Postgres, SQLite, or Redis—or run in-memory for tests.
 - **Safe.** One operation at a time, always. No race conditions, no corrupted state.
 - **Evolvable.** Schema changes are type-checked and automatic. Add a field, rename a property—old entities migrate on load.
-- **Streamable.** Long-running operations yield progress in real-time.
+- **Streamable.** Long-running operations yield progress in real-time. Streams survive client disconnects—reconnect and resume where you left off.
 - **Time-travel.** Query historical state at any point with full type safety.
 
 ## Installation
@@ -146,7 +146,7 @@ const ref = manager.get("entity-id");
 
 await ref.send.someCommand(); // Execute a command (may modify state)
 await ref.read.someQuery(); // Execute a query (read-only)
-ref.stream.streamingCommand(); // Get AsyncIterable for streaming commands
+const run = ref.stream.streamingCommand(); // StreamRun with .id for reconnection
 await ref.snapshot(); // Get current state and version
 await ref.stateAt(version); // Get historical state at a specific event version
 await ref.stop(); // Manually stop this entity
@@ -185,6 +185,46 @@ const Entity = define("Entity")
   .persistence({ snapshotEvery: 100 }) // Snapshot every 100 versions
   .build();
 ```
+
+## Durable Streams
+
+When persistence is enabled, streams automatically record every yielded value. If a client disconnects mid-stream - browser refresh, network blip, mobile app backgrounded - the stream keeps running on the server. The client reconnects and picks up exactly where it left off. No lost data, no restarting from scratch.
+
+```typescript
+// Start a long-running operation
+const run = ref.stream.generateReport(params);
+
+// Return the stream ID to the client immediately
+res.json({ streamId: run.id });
+
+// Stream continues in the background, persisting each chunk
+```
+
+The client consumes live or reconnects later:
+
+```typescript
+// First connection: consume live
+for await (const { seq, data } of manager.readStream(streamId)) {
+  render(data);
+  lastSeq = seq; // Track position for reconnection
+}
+
+// After disconnect: resume from last position
+for await (const { seq, data } of manager.readStream(streamId, { after: lastSeq })) {
+  render(data);
+}
+```
+
+Check stream status without consuming:
+
+```typescript
+const status = await manager.streamStatus(streamId);
+// { state: 'running', seq: 42n }
+// { state: 'complete', seq: 100n }
+// { state: 'error', seq: 50n, error: 'timeout' }
+```
+
+This is essential for AI assistants, file processors, report generators - any operation that takes longer than a network timeout.
 
 ## Schema Evolution
 
@@ -354,6 +394,25 @@ Under the hood, Cue uses **event sourcing**. Every state change is recorded as a
 
 But you don't need to think about events. Write mutations directly—Cue captures them automatically via Immer.
 
+## On Persistence Complexity
+
+Cue doesn't force a specific persistence provider. You implement `PersistenceAdapter` for whatever database you have. This flexibility adds some decision-making, but most applications won't need anything complicated.
+
+**PostgreSQL handles more than you think:**
+
+| Workload | PostgreSQL (single instance) |
+| -------- | ---------------------------- |
+| < 500 events/sec | Comfortable, no tuning needed |
+| 500 - 2,000 events/sec | Add connection pooling |
+| 2,000 - 5,000 events/sec | Tune indexes, batch writes, consider read replicas |
+| > 5,000 events/sec | Time to think about Redis or sharding |
+
+These are rough estimates for a typical cloud database. Your mileage varies with hardware, event size, and query patterns.
+
+**Redis is powerful but often unnecessary.** Redis Streams map beautifully to Cue's event model - fast writes, blocking reads for live streaming, built-in consumer groups. But remember: Cue already keeps hot entities in memory. The EntityManager holds active entities, passivation evicts idle ones. Your database only sees hydration reads and event writes, not every state access.
+
+For most applications - even busy ones - PostgreSQL with snapshotting enabled is plenty. Add Redis when you have evidence you need it, not before.
+
 ## API Reference
 
 ### `define(name)`
@@ -391,16 +450,25 @@ const ref = manager.get("id");
 
 ref.send.command(...args); // Execute command, returns Promise
 ref.read.query(...args); // Execute query, returns Promise
-ref.stream.command(...args); // Returns AsyncIterable for streaming commands
+ref.stream.command(...args); // Returns StreamRun<T> with .id, .seq, .isLive
 ref.snapshot(); // Returns Promise<{ state, version }>
 ref.stateAt(eventVersion); // Returns Promise<{ schemaVersion, state }>
 ref.stop(); // Stop and release this entity
 ```
 
+### `EntityManager`
+
+```typescript
+manager.get("id"); // Get or create entity reference
+manager.readStream(streamId, { after? }); // Read durable stream by ID
+manager.streamStatus(streamId); // Get stream state without consuming
+manager.stop(); // Shut down all entities
+```
+
 ### Type Utilities
 
 ```typescript
-import { HistoryOf, VersionState, StateOf } from "@twoabove/cue";
+import { HistoryOf, VersionState, StateOf, StreamRun, StreamStatus } from "@twoabove/cue";
 
 type History = HistoryOf<typeof Entity>; // Discriminated union of all versions
 type V2State = VersionState<typeof Entity, 2>; // State type at schema version 2

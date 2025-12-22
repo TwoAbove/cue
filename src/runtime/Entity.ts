@@ -15,6 +15,15 @@ import type {
 } from "../persistence/types";
 import { clone, deserialize, serialize } from "../serde";
 import {
+  STREAM_ENTITY_DEF_NAME,
+  STREAM_SCHEMA_VERSION,
+} from "../stream/constants";
+import type {
+  StreamChunkEnvelope,
+  StreamEndEnvelope,
+  StreamRun,
+} from "../stream/types";
+import {
   _handlers,
   _initialStateFn,
   _name,
@@ -29,6 +38,7 @@ import type {
 } from "../types/public";
 import type { Clock } from "../utils/clock";
 import { WallClock } from "../utils/clock";
+import { newId } from "../utils/id";
 import { Mailbox } from "./Mailbox";
 import { Supervise } from "./Supervision";
 
@@ -49,7 +59,7 @@ export class Entity<TState extends object> {
     private readonly store?: PersistenceAdapter,
     private readonly supervisor?: Supervisor,
     private readonly metrics?: EntityMetrics,
-    private readonly clock: Clock = WallClock
+    private readonly clock: Clock = WallClock,
   ) {
     this.kernel = new StateKernel(this.def);
     this.lastTouch = this.clock.now();
@@ -77,7 +87,7 @@ export class Entity<TState extends object> {
           const stream = this.kernel.startStream(
             handlerName,
             args,
-            this.buildContext()
+            this.buildContext(),
           );
           let finalReturn: unknown;
           try {
@@ -95,7 +105,7 @@ export class Entity<TState extends object> {
                 args,
                 finalReturn,
                 patches,
-                nextState
+                nextState,
               );
             }
           } catch (e) {
@@ -109,7 +119,7 @@ export class Entity<TState extends object> {
           await this.kernel.applyCommand(
             handlerName,
             args,
-            this.buildContext()
+            this.buildContext(),
           );
         if (patches.length > 0) {
           await this.commit(handlerName, args, returnValue, patches, nextState);
@@ -123,7 +133,7 @@ export class Entity<TState extends object> {
           this.kernel.state,
           this.supervisor,
           this.onReset,
-          this.onStop
+          this.onStop,
         );
       }
       return task();
@@ -139,11 +149,10 @@ export class Entity<TState extends object> {
 
   public stream = (
     handlerName: string,
-    args: unknown[]
-  ): AsyncGenerator<unknown, unknown, unknown> => {
-    // Stream holds the mailbox for its entire duration to prevent interleaved
-    // commands from causing state overwrites when the stream commits.
+    args: unknown[],
+  ): StreamRun<unknown> => {
     const self = this;
+    const streamId = `${this.id}:${handlerName}:${newId()}`;
 
     type ChannelItem =
       | { type: "value"; value: unknown }
@@ -157,6 +166,8 @@ export class Entity<TState extends object> {
       reject: (e: Error) => void;
     } | null = null;
     let aborted = false;
+    let currentSeq = 0n;
+    let isLive = true;
 
     function push(item: ChannelItem) {
       if (consumerWaiting) {
@@ -193,28 +204,67 @@ export class Entity<TState extends object> {
       }
     }
 
+    async function commitStreamChunk(value: unknown): Promise<void> {
+      if (!self.store) return;
+      currentSeq += 1n;
+      const envelope: StreamChunkEnvelope = {
+        entityDefName: STREAM_ENTITY_DEF_NAME,
+        schemaVersion: STREAM_SCHEMA_VERSION,
+        handler: "chunk",
+        payload: [value],
+        patches: [],
+      };
+      await self.store.commitEvent(streamId, currentSeq, serialize(envelope));
+    }
+
+    async function commitStreamEnd(
+      state: "complete" | "error",
+      error?: string,
+    ): Promise<void> {
+      if (!self.store) return;
+      currentSeq += 1n;
+      const payload: StreamEndEnvelope["payload"][0] = { state };
+      if (error) {
+        payload.error = error;
+      }
+      const envelope: StreamEndEnvelope = {
+        entityDefName: STREAM_ENTITY_DEF_NAME,
+        schemaVersion: STREAM_SCHEMA_VERSION,
+        handler: "end",
+        payload: [payload],
+        patches: [],
+      };
+      await self.store.commitEvent(streamId, currentSeq, serialize(envelope));
+    }
+
     const mailboxTask = self.mailbox.enqueue(async () => {
       await self.ensureActive();
       const stream = self.kernel.startStream(
         handlerName,
         args,
-        self.buildContext()
+        self.buildContext(),
       );
 
       try {
         for await (const value of stream.generator) {
+          await commitStreamChunk(value);
           push({ type: "value", value });
           await new Promise<void>((resolve, reject) => {
             producerWaiting = { resolve, reject };
           });
         }
         push({ type: "done" });
+        await commitStreamEnd("complete");
       } catch (e) {
         if (!aborted) {
           stream.discard();
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          await commitStreamEnd("error", errorMsg);
           push({ type: "error", error: e });
           return;
         }
+        // If aborted by consumer, still write end event
+        await commitStreamEnd("complete");
       }
 
       const { patches, nextState } = stream.finalize();
@@ -223,26 +273,42 @@ export class Entity<TState extends object> {
       }
     });
 
-    async function* outerGenerator(): AsyncGenerator<
-      unknown,
-      unknown,
-      unknown
-    > {
+    async function* outerGenerator(): AsyncGenerator<unknown, void, unknown> {
       try {
         while (true) {
           const item = await pull();
-          if (item.type === "done") return;
-          if (item.type === "error") throw item.error;
+          if (item.type === "done") {
+            isLive = false;
+            return;
+          }
+          if (item.type === "error") {
+            isLive = false;
+            throw item.error;
+          }
           yield item.value;
           signalProducerContinue();
         }
       } finally {
         signalProducerAbort();
         await mailboxTask;
+        isLive = false;
       }
     }
 
-    return outerGenerator();
+    const streamRun: StreamRun<unknown> = {
+      id: streamId,
+      get seq() {
+        return currentSeq;
+      },
+      get isLive() {
+        return isLive;
+      },
+      [Symbol.asyncIterator]() {
+        return outerGenerator();
+      },
+    };
+
+    return streamRun;
   };
 
   public inspect = async (): Promise<{ state: TState; version: bigint }> => {
@@ -261,7 +327,7 @@ export class Entity<TState extends object> {
   };
 
   public stateAt = async (
-    targetVersion: bigint
+    targetVersion: bigint,
   ): Promise<{ schemaVersion: number; state: unknown }> => {
     if (!this.store) {
       throw new Error("stateAt requires a persistence store");
@@ -296,7 +362,7 @@ export class Entity<TState extends object> {
           state,
           schemaVersion,
           envelope.schemaVersion,
-          this.def
+          this.def,
         );
         schemaVersion = envelope.schemaVersion;
       }
@@ -315,7 +381,7 @@ export class Entity<TState extends object> {
     payload: unknown[],
     returnVal: unknown,
     patches: Patch,
-    nextState: TState
+    nextState: TState,
   ) {
     if (!this.store) {
       this.kernel.applyCommittedState(nextState);
@@ -369,7 +435,7 @@ export class Entity<TState extends object> {
             const snapshot = deserialize<SnapshotEnvelope>(snapshotRec.data);
             if (snapshot.entityDefName !== this.def[_name])
               throw new DefinitionMismatchError(
-                `Hydrating entity '${this.id}' with definition '${this.def[_name]}', but snapshot is from '${snapshot.entityDefName}'.`
+                `Hydrating entity '${this.id}' with definition '${this.def[_name]}', but snapshot is from '${snapshot.entityDefName}'.`,
               );
             baseState = snapshot.state as TState;
             baseVersion = snapshotRec.version;
@@ -386,7 +452,7 @@ export class Entity<TState extends object> {
           for (const rec of eventRecs) {
             if (rec.version !== expectedVersion)
               throw new OutOfOrderEventsError(
-                `Hydrating entity '${this.id}': expected event version ${expectedVersion}, but got ${rec.version}.`
+                `Hydrating entity '${this.id}': expected event version ${expectedVersion}, but got ${rec.version}.`,
               );
             const envelope = deserialize<EventEnvelope>(rec.data);
             events.push({
@@ -408,7 +474,7 @@ export class Entity<TState extends object> {
         this.status = "failed";
         this.error = new HydrationError(
           `Failed to hydrate entity '${this.id}'`,
-          { cause: err }
+          { cause: err },
         );
         this.metrics?.onError?.(this.id, this.error);
         throw this.error;
@@ -431,13 +497,13 @@ export class Entity<TState extends object> {
         await this.store.commitSnapshot(
           this.id,
           this.kernel.version,
-          serialize(envelope)
+          serialize(envelope),
         );
         this.metrics?.onSnapshot?.(this.id, this.kernel.version);
       } catch (err) {
         this.metrics?.onError?.(
           this.id,
-          err instanceof Error ? err : new Error(String(err))
+          err instanceof Error ? err : new Error(String(err)),
         );
       }
     }

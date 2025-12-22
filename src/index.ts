@@ -2,6 +2,13 @@ export type { Draft, Immutable } from "immer";
 export * from "./api/index";
 export * from "./errors/index";
 export type * from "./persistence/types";
+export type {
+  ReadStreamOptions,
+  StreamChunk,
+  StreamReader,
+  StreamRun,
+  StreamStatus,
+} from "./stream/types";
 export {
   _handlers,
   _initialStateFn,

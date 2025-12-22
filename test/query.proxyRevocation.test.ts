@@ -23,7 +23,7 @@ describe("Query return values", () => {
     const actor = manager.get("test-1");
     const itemsMap = await actor.read.getItemsAsMap();
 
-    for (const [key, value] of itemsMap.entries()) {
+    for (const [_key, value] of itemsMap.entries()) {
       expect(typeof value.name).toBe("string");
     }
     expect(itemsMap.get("key1")?.name).toBe("Item 1");
@@ -34,7 +34,10 @@ describe("Query return values", () => {
   it("returns usable Set created from state", async () => {
     const Def = define("SetQuery")
       .initialState(() => ({
-        tags: [{ id: 1, name: "tag1" }, { id: 2, name: "tag2" }],
+        tags: [
+          { id: 1, name: "tag1" },
+          { id: 2, name: "tag2" },
+        ],
       }))
       .queries({
         getTagsAsSet: (state) => new Set(state.tags),
