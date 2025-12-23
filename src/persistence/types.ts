@@ -38,4 +38,6 @@ export interface PersistenceAdapter {
   ): Promise<void>;
 
   clearEntity?(entityId: string): Promise<void>;
+
+  subscribeEvents?(entityId: string, callback: () => void): () => void;
 }

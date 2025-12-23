@@ -16,7 +16,9 @@ export interface StreamRun<T> extends AsyncIterable<T> {
   readonly isLive: boolean;
 }
 
-export interface StreamReader<T> extends AsyncIterable<StreamChunk<T>> {
+export interface StreamReader<T>
+  extends AsyncIterable<StreamChunk<T>>,
+    AsyncDisposable {
   readonly isLive: boolean;
 }
 

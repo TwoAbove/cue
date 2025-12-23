@@ -218,4 +218,79 @@ describe("Durable Streams", () => {
 
     await manager.stop();
   });
+
+  it("readStream waits for and receives live events", async () => {
+    const store = new InMemoryPersistenceAdapter();
+    const manager = create({ definition: Counter, store });
+    const ref = manager.get(newId());
+
+    const run = ref.stream.streamGrow(3);
+    const streamId = run.id;
+
+    const chunks: Array<{ seq: bigint; data: unknown }> = [];
+
+    {
+      await using reader = manager.readStream(streamId);
+      for await (const chunk of reader) {
+        chunks.push(chunk);
+      }
+    }
+
+    expect(chunks).toHaveLength(3);
+    expect(chunks[0]).toEqual({ seq: 1n, data: { i: 1, n: 1 } });
+    expect(chunks[2]).toEqual({ seq: 3n, data: { i: 3, n: 3 } });
+
+    await manager.stop();
+  });
+
+  it("readStream cleans up subscription on early break", async () => {
+    const store = new InMemoryPersistenceAdapter();
+    const manager = create({ definition: Counter, store });
+    const ref = manager.get(newId());
+
+    const run = ref.stream.streamGrow(5);
+    const streamId = run.id;
+
+    const chunks: Array<{ seq: bigint; data: unknown }> = [];
+
+    {
+      await using reader = manager.readStream(streamId);
+      for await (const chunk of reader) {
+        chunks.push(chunk);
+        if (chunks.length === 2) break;
+      }
+      expect(reader.isLive).toBe(false);
+    }
+
+    expect(chunks).toHaveLength(2);
+
+    await new Promise((r) => setTimeout(r, 50));
+    const status = await manager.streamStatus(streamId);
+    expect(status?.state).toBe("complete");
+
+    await manager.stop();
+  });
+
+  it("readStream with await using disposes correctly", async () => {
+    const store = new InMemoryPersistenceAdapter();
+    const manager = create({ definition: Counter, store });
+    const ref = manager.get(newId());
+
+    const run = ref.stream.streamGrow(3);
+    const streamId = run.id;
+
+    let readerRef: { isLive: boolean } | undefined;
+
+    {
+      await using reader = manager.readStream(streamId);
+      readerRef = reader;
+      for await (const _ of reader) {
+        break;
+      }
+    }
+
+    expect(readerRef?.isLive).toBe(false);
+
+    await manager.stop();
+  });
 });

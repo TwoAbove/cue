@@ -55,8 +55,19 @@ export function readStream<T>(
   streamId: string,
   options?: ReadStreamOptions,
 ): StreamReader<T> {
-  const afterSeq = options?.after ?? 0n;
+  let cursor = options?.after ?? 0n;
   let isLive = true;
+  let disposed = false;
+  let unsubscribe: (() => void) | undefined;
+  let wakeUp: (() => void) | undefined;
+
+  async function cleanup() {
+    if (disposed) return;
+    disposed = true;
+    isLive = false;
+    unsubscribe?.();
+    wakeUp?.();
+  }
 
   const reader: StreamReader<T> = {
     get isLive() {
@@ -64,32 +75,56 @@ export function readStream<T>(
     },
 
     async *[Symbol.asyncIterator](): AsyncIterator<StreamChunk<T>> {
-      const events = await store.getEvents(streamId, afterSeq);
+      if (disposed) return;
 
-      for (const event of events) {
-        const envelope = deserialize<StreamEventEnvelope>(event.data);
+      unsubscribe = store.subscribeEvents?.(streamId, () => wakeUp?.());
 
-        if (envelope.entityDefName !== STREAM_ENTITY_DEF_NAME) {
-          continue;
+      try {
+        while (!disposed) {
+          const events = await store.getEvents(streamId, cursor);
+
+          for (const event of events) {
+            const envelope = deserialize<StreamEventEnvelope>(event.data);
+
+            if (envelope.entityDefName !== STREAM_ENTITY_DEF_NAME) {
+              continue;
+            }
+
+            if (envelope.handler === "end") {
+              isLive = false;
+              return;
+            }
+
+            if (envelope.handler === "chunk") {
+              yield {
+                seq: event.version,
+                data: envelope.payload[0] as T,
+              };
+              cursor = event.version;
+            }
+          }
+
+          const status = await streamStatus(store, streamId);
+          if (status && status.state !== "running") {
+            isLive = false;
+            return;
+          }
+
+          await new Promise<void>((resolve) => {
+            wakeUp = resolve;
+            if (!store.subscribeEvents) {
+              setTimeout(resolve, 100);
+            }
+          });
+          wakeUp = undefined;
         }
-
-        if (envelope.handler === "end") {
-          isLive = false;
-          return;
-        }
-
-        if (envelope.handler === "chunk") {
-          yield {
-            seq: event.version,
-            data: envelope.payload[0] as T,
-          };
-        }
+      } finally {
+        await cleanup();
       }
+    },
 
-      const status = await streamStatus(store, streamId);
-      if (status && status.state !== "running") {
-        isLive = false;
-      }
+    async [Symbol.asyncDispose]() {
+      await cleanup();
     },
   };
 

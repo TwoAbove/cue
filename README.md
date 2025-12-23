@@ -174,6 +174,7 @@ interface PersistenceAdapter {
   getLatestSnapshot(entityId: string): Promise<SnapshotRecord | null>;
   commitSnapshot(entityId: string, version: bigint, data: string): Promise<void>;
   clearEntity?(entityId: string): Promise<void>;
+  subscribeEvents?(entityId: string, callback: () => void): () => void;
 }
 ```
 
@@ -203,15 +204,21 @@ res.json({ streamId: run.id });
 The client consumes live or reconnects later:
 
 ```typescript
-// First connection: consume live
-for await (const { seq, data } of manager.readStream(streamId)) {
-  render(data);
-  lastSeq = seq; // Track position for reconnection
+// Consume live - iterator blocks until stream completes
+{
+  await using reader = manager.readStream(streamId);
+  for await (const { seq, data } of reader) {
+    render(data);
+    lastSeq = seq;
+  }
 }
 
 // After disconnect: resume from last position
-for await (const { seq, data } of manager.readStream(streamId, { after: lastSeq })) {
-  render(data);
+{
+  await using reader = manager.readStream(streamId, { after: lastSeq });
+  for await (const { seq, data } of reader) {
+    render(data);
+  }
 }
 ```
 

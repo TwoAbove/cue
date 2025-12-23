@@ -24,6 +24,7 @@ function auditVersion(currentVersion: bigint, newVersion: bigint) {
 export class InMemoryPersistenceAdapter implements PersistenceAdapter {
   private events = new Map<string, EventRecord[]>();
   private snapshots = new Map<string, SnapshotRecord>();
+  private subscribers = new Map<string, Set<() => void>>();
 
   async getEvents(
     entityId: string,
@@ -49,6 +50,11 @@ export class InMemoryPersistenceAdapter implements PersistenceAdapter {
 
     entityEvents.push({ version, data });
     this.events.set(entityId, entityEvents);
+
+    const subs = this.subscribers.get(entityId);
+    if (subs) {
+      for (const cb of subs) cb();
+    }
   }
 
   async getLatestSnapshot(entityId: string): Promise<SnapshotRecord | null> {
@@ -69,9 +75,25 @@ export class InMemoryPersistenceAdapter implements PersistenceAdapter {
     this.snapshots.delete(entityId);
   }
 
-  // test helper
+  subscribeEvents(entityId: string, callback: () => void): () => void {
+    let subs = this.subscribers.get(entityId);
+    if (!subs) {
+      subs = new Set();
+      this.subscribers.set(entityId, subs);
+    }
+    subs.add(callback);
+
+    return () => {
+      subs.delete(callback);
+      if (subs.size === 0) {
+        this.subscribers.delete(entityId);
+      }
+    };
+  }
+
   clear(): void {
     this.events.clear();
     this.snapshots.clear();
+    this.subscribers.clear();
   }
 }
