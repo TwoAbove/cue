@@ -93,10 +93,11 @@ export class StateKernel<TState extends object> {
 
     try {
       const returnValue = await Promise.resolve(entry.fn(draft, ...args, ctx));
+      const clonedReturnValue = clone(returnValue);
       const nextState = finishDraft(draft, (p: ImmerPatch[]) => {
         patches = p as unknown as Patch;
       }) as TState;
-      return { returnValue, patches, nextState };
+      return { returnValue: clonedReturnValue, patches, nextState };
     } catch (e) {
       finishDraft(draft);
       throw e;
