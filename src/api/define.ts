@@ -13,7 +13,6 @@ import type {
   AnyHandler,
   BuiltEntityDefinition,
   CreateMessageMap,
-  Draft,
   HandlerEntry,
 } from "../types/public";
 
@@ -66,7 +65,7 @@ class DefinitionBuilder<
     const C extends Record<
       string,
       // biome-ignore lint/suspicious/noExplicitAny: This is intentional for the builder
-      (state: Draft<TState>, ...args: any[]) => unknown
+      (state: TState, ...args: any[]) => unknown
     >,
   >(newCommands: C) {
     return new DefinitionBuilder<
